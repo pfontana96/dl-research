@@ -1,0 +1,1 @@
+Python implementation of diffetent Machine Learning algorithms from scratch based on Deep Learning Book 
