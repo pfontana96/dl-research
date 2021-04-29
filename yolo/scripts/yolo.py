@@ -4,10 +4,46 @@ from tensorflow.nn import space_to_depth
 from tensorflow.keras.utils import Sequence
 from tensorflow.keras import Model
 from tensorflow.keras.layers import Reshape, Activation, Conv2D, Input, MaxPooling2D, BatchNormalization, Flatten, Dense, Lambda, LeakyReLU, concatenate
+from tensorflow.keras.callbacks import Callback
+from tensorflow.keras.backend import get_value, set_value
 
-from utils import BestAnchorBoxFinder, ImageReader
+from pathlib import Path
 
-# the function to implement the orgnization layer (thanks to github.com/allanzelener/YAD2K)
+from utils import BestAnchorBoxFinder, ImageReader, WeightsReader, read_bytes
+
+class LearningRateScheduler(Callback):
+    def __init__(self, schedule):
+        """
+        Arguments:
+        ---------
+        schedule: 
+        """
+        super(LearningRateScheduler, self).__init__()
+        self.schedule = schedule
+
+    def on_epoch_begin(self, epoch, logs=None):
+        if not hasattr(self.model.optimizer, "lr"):
+            raise ValueError("Optimizer must have a 'lr' attribute.")
+        # Get current learning rate
+        lr = float(get_value(self.model.optimizer.learning_rate))
+        # Get scheduled learning rate
+        scheduled_lr = self.get_scheduled_lr(epoch, lr)
+        if lr != scheduled_lr:
+            set_value(self.model.optimizer.learning_rate, scheduled_lr)
+            print('Epoch {}: Learning rate changed from {} to {}'.format(epoch, lr, 
+                                                                        scheduled_lr))
+    def get_scheduled_lr(self, epoch, lr):
+        """
+        Helper function to get scheduled learning_rate
+        """
+        if epoch < self.schedule[0, 0] or epoch > self.schedule[-1, 0]:
+            return lr
+        for s_epoch, s_lr in self.schedule:
+            if s_epoch == epoch:
+                return s_lr
+        return lr
+
+# the function to implement the orgnization layer (thanks to https://github.com/allanzelener/YAD2K)
 def space_to_depth_x2(x):
     return space_to_depth(x, block_size=2)
 
@@ -94,14 +130,72 @@ class YOLO_v2(Model):
         output = Reshape((self.grid[1], self.grid[0], self.nb_anchors, 5+self.nb_classes))(x)
         output = self.lambda_2([output, true_boxes])
         
-        return output
+        return output   
 
-    def get_model(self):
+    def summary(self):
+        # Hack for being able to see built model
         x = Input(shape=(self.img_shape[1], self.img_shape[1], 3))
         true_boxes = Input(shape=(1, 1, 1, self.true_box_buffer , 4))
 
-        return Model(inputs=[x, true_boxes], outputs=self.call([x, true_boxes]))
+        return Model(inputs=[x, true_boxes], outputs=self.call([x, true_boxes])).summary()
 
+    def load_weights_from_file(self, filename):
+        """
+        Loads saved weights to model 
+
+        Arguments:
+        ---------
+        model: [tf.keras.Model] Model
+        nb_grids: [int] # of gridcells
+        """
+        assert(isinstance(filename, Path)), "Weights file must be given as [pathlib.Path]"
+
+        # TODO: Should implement some sort of assertion to verify the weights file and the
+        #       model are compatible (same amount)
+        all_weights = np.fromfile(filename, dtype='float32')
+        offset = 4
+
+        nb_convs = len(self.convs)
+        nb_grids = np.prod(self.grid)
+
+        for layer in self.layers:
+
+            weights_list = layer.get_weights() 
+
+            if 'conv' in layer.name:
+                if len(weights_list) > 1: # Kernel and bias
+                    bias, offset = read_bytes(all_weights, offset, np.prod(weights_list[1].shape))
+                    kernel, offset = read_bytes(all_weights, offset, np.prod(weights_list[0].shape))
+                    kernel = kernel.reshape(list(reversed(weights_list[0].shape)))
+                    kernel = kernel.transpose([2, 3, 1, 0]) # TODO: Investigate this transpose (why that order of axis, look how kernel are stored in weigths file)
+
+                    layer.set_weights([kernel, bias])
+                else: # just kernel
+                    kernel, offset = read_bytes(all_weights, offset, np.prod(weights_list[0].shape))
+                    kernel = kernel.reshape(list(reversed(weights_list[0].shape)))
+                    kernel = kernel.transpose([2, 3, 1, 0]) # TODO: Investigate this transpose (why that order of axis, look how kernel are stored in weigths file)
+
+                    layer.set_weights([kernel])
+
+            if 'norm' in layer.name:
+
+                size = np.prod(weights_list[0].shape)
+
+                beta, offset = read_bytes(all_weights, offset, size)
+                gamma, offset = read_bytes(all_weights, offset, size)
+                mean, offset = read_bytes(all_weights, offset, size)
+                var, offset = read_bytes(all_weights, offset, size)
+
+                layer.set_weights([gamma, beta, mean, var])
+        
+        # Rescale last conv kernel to ouput image
+        layer = self.get_layer('conv_{}'.format(nb_convs))
+
+        weights_list = layer.get_weights()
+
+        new_kernel = np.random.normal(size=weights_list[0].shape)/nb_grids
+        new_bias = np.random.normal(size=weights_list[1].shape)/nb_grids
+        layer.set_weights([new_kernel, new_bias])  
 
 class BatchGenerator(Sequence):
     def __init__(self, images, config, norm=None, shuffle=True):
@@ -127,20 +221,18 @@ class BatchGenerator(Sequence):
 
     def __getitem__(self, idx):
         '''
-        == input == 
+        Arguments:
+        ---------
+        idx : [int] non-negative integer value e.g., 0
         
-        idx : non-negative integer value e.g., 0
-        
-        == output ==
-        
-        x_batch: The numpy array of shape  (BATCH_SIZE, IMAGE_H, IMAGE_W, N channels).
+        Return:
+        ------
+        x_batch: [np.array] Array of shape  (BATCH_SIZE, IMAGE_H, IMAGE_W, N channels).
             
             x_batch[iframe,:,:,:] contains a iframeth frame of size  (IMAGE_H,IMAGE_W).
             
-        y_batch:
-
-            The numpy array of shape  (BATCH_SIZE, GRID_H, GRID_W, BOX, 4 + 1 + N classes). 
-            BOX = The number of anchor boxes.
+        y_batch: [np.array] Array of shape  (BATCH_SIZE, GRID_H, GRID_W, BOX, 4 + 1 + N classes). 
+                            BOX = The number of anchor boxes.
 
             y_batch[iframe,igrid_h,igrid_w,ianchor,:4] contains (center_x,center_y,center_w,center_h) 
             of ianchorth anchor at  grid cell=(igrid_h,igrid_w) if the object exists in 
@@ -153,9 +245,7 @@ class BatchGenerator(Sequence):
             class object exists in this (grid cell, anchor) pair, else it contains 0.
 
 
-        b_batch:
-
-            The numpy array of shape (BATCH_SIZE, 1, 1, 1, TRUE_BOX_BUFFER, 4).
+        b_batch: [np.array] Array of shape (BATCH_SIZE, 1, 1, 1, TRUE_BOX_BUFFER, 4).
 
             b_batch[iframe,1,1,1,ibuffer,ianchor,:] contains ibufferth object's 
             (center_x,center_y,center_w,center_h) in iframeth frame.
@@ -241,10 +331,16 @@ def main():
     p = Path(__file__).resolve().parent 
     config = load_config(p.joinpath('config.yaml'))
 
-    yolov2 = YOLO_v2(config)
-    model = yolov2.get_model()
+    model = YOLO_v2(config)
     model.summary()
+    model.load_weights_from_file(p.joinpath('yolov2.weights'))
+    # yolov2 = YOLO_v2(config)
+    # model = yolov2.get_model()
+    # model.summary()
     
+    # w_reader = WeightsReader(p.joinpath('yolov2.weights'))
+    # w_reader.load_weights(model)
+
     # import yaml
     # from pathlib import Path
     # from matplotlib import pyplot as plt

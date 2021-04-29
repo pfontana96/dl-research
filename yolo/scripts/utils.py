@@ -6,6 +6,28 @@ from copy import deepcopy
 
 import numpy as np
 
+import tensorflow as tf
+from tensorflow.keras.backend import sigmoid, exp,  sum as k_sum
+
+def calculate_loss(y_pred, y_true, true_boxes, anchors):
+    _, _, _, true_box_buffer, _ = true_boxes.shape
+    _, grid_h, grid_w, nb_anchors, _ = y_pred.shape
+     # grid coords tensor
+    coord_x = tf.cast(tf.reshape(tf.tile(tf.range(grid_w), [grid_h]), (1, grid_h, grid_w, 1, 1)), tf.float32)
+    coord_y = tf.transpose(coord_x, (0,2,1,3,4))
+    coords = tf.tile(tf.concat([coord_x,coord_y], -1), [y_pred.shape[0], 1, 1, 5, 1])
+
+    # Coordinate loss
+    pred_xy = sigmoid(y_pred[:, :, :, :, 0:2]) # Adjust coordinates between 1 and 0
+    pred_xy += coords # Add cell coord for comparisson with ground truth. New coords in grid cell coords
+    pred_wh = exp(y_pred[:, :, :, :, 2:4])*anchors # Adjust width and height for comparisson with ground truth
+
+    nb_detector_mask = k_sum()
+
+def read_bytes(weights, offset, size):
+    offset += size
+    return (weights[offset-size:offset], offset)
+
 def load_config(filename):
     """
     Loads config file into a dict of numpy objects
@@ -314,3 +336,71 @@ class BestAnchorBoxFinder(object):
 
         return index, ious[index]
 
+class WeightsReader(object):
+    def __init__(self, weights_file):
+        assert(isinstance(weights_file, Path)), "Weights file must be given as [pathlib.Path]"
+        self.offset = 4
+        self.all_weights = np.fromfile(weights_file, dtype='float32')
+
+    def read_bytes(self, size):
+        self.offset += size
+        return self.all_weights[self.offset-size:(self.offset)]
+        
+    def reset(self):
+        self.offset = 4
+    
+    def load_weights(self, model):
+        """
+        Loads saved weights to model 
+
+        Arguments:
+        ---------
+        model: [tf.keras.Model] Model
+        nb_grids: [int] # of gridcells
+        """
+        # TODO: Should implement some sort of assertion to verify the weights file and the
+        #       model are compatible (same amount)
+
+        layers_names = np.array([l.name.split('_')[0] for l in model.layers], dtype=str)
+        nb_convs = len(layers_names[layers_names=='conv'])
+        nb_grids = np.prod(model.grid)
+        self.reset()
+
+        for layer in model.layers:
+
+            weights_list = layer.get_weights() 
+
+            if 'conv' in layer.name:
+                if len(weights_list) > 1: # Kernel and bias
+                    bias = self.read_bytes(np.prod(weights_list[1].shape))
+                    kernel = self.read_bytes(np.prod(weights_list[0].shape))
+                    kernel = kernel.reshape(list(reversed(weights_list[0].shape)))
+                    kernel = kernel.transpose([2, 3, 1, 0]) # TODO: Investigate this transpose (why that order of axis, look how kernel are stored in weigths file)
+
+                    layer.set_weights([kernel, bias])
+                else: # just kernel
+                    kernel = self.read_bytes(np.prod(weights_list[0].shape))
+                    kernel = kernel.reshape(list(reversed(weights_list[0].shape)))
+                    kernel = kernel.transpose([2, 3, 1, 0]) # TODO: Investigate this transpose (why that order of axis, look how kernel are stored in weigths file)
+
+                    layer.set_weights([kernel])
+
+            if 'norm' in layer.name:
+
+                size = np.prod(weights_list[0].shape)
+
+                beta = self.read_bytes(size)
+                gamma = self.read_bytes(size)
+                mean = self.read_bytes(size)
+                var = self.read_bytes(size)
+
+                layer.set_weights([gamma, beta, mean, var])
+        
+        # Rescale last conv kernel to ouput image
+        layer = model.get_layer('conv_{}'.format(nb_convs))
+
+        weights_list = layer.get_weights()
+
+        new_kernel = np.random.normal(size=weights_list[0].shape)/nb_grids
+        new_bias = np.random.normal(size=weights_list[1].shape)/nb_grids
+        layer.set_weights([new_kernel, new_bias])  
