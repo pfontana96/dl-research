@@ -2,6 +2,19 @@ from matplotlib import pyplot as plt
 import numpy as np
 import seaborn as sns
 
+def plot_image(x_batch_instace, y_batch_instance, labels, plot_grid=False, confidence_threshold=1):
+    
+    grid_h, grid_w, _, _ = y_batch_instance.shape
+    img_h, img_w, _ = x_batch_instace.shape
+
+    if plot_grid:
+        plot_img_with_gridcell(x_batch_instace, (grid_w, grid_h))
+    else:
+        plt.figure(figsize=(15,15))
+        plt.imshow(x_batch_instace)
+
+    plot_bbox(y_batch_instance, (img_h, img_w), labels, confidence_threshold)
+
 def plot_img_with_gridcell(img, grids, color="yellow"):
     """
 
@@ -30,20 +43,18 @@ def plot_img_with_gridcell(img, grids, color="yellow"):
     plt.yticks([(i + 0.5)*img_h/grid_h for i in range(grid_h)],
                 ["iGRIDH={}".format(i) for i in range(grid_h)])
 
-def plot_bbox(output_instance, img_shape, labels):
+def plot_bbox(output_instance, img_shape, labels, confidence_threshold=1):
     color_palette = list(sns.xkcd_rgb.values())
 
-    grid_y, grid_x, anchor_id = np.where(output_instance[:,:,:,4] == 1)
+    grid_y, grid_x, anchor_id = np.where(output_instance[:,:,:,4] >= confidence_threshold)
 
     confident_outputs = output_instance[grid_y, grid_x, anchor_id] # Boxes with confidence 1
     predicted_bboxes = confident_outputs[:, 0:4] # x, y, w, h
+    scores = confident_outputs[:, 4]
 
     nb_grids_y, nb_grids_x, _, _ = output_instance.shape
     grid_width = img_shape[0]/nb_grids_x
     grid_height = img_shape[1]/nb_grids_y
-
-    offsets_x = grid_x*grid_width
-    offsets_y = grid_y*grid_height
 
     bbox_ids, labels_ids = np.where(confident_outputs[:, 5:])
     names = labels[labels_ids]
@@ -52,10 +63,8 @@ def plot_bbox(output_instance, img_shape, labels):
     for bbox in predicted_bboxes:
         x, y, w, h = bbox
 
-        # We need to rescale as x,y are given in px respecto to the 0,0 of current gridcell
-        # and w, h are given times*gridcell_width and height respectively
-        x = x + offsets_x[id_obj]
-        y = y + offsets_y[id_obj]
+        x = (x + grid_x[id_obj])*grid_width 
+        y = (y + grid_y[id_obj])*grid_height
         w = w*grid_width
         h = h*grid_height
 
@@ -67,13 +76,14 @@ def plot_bbox(output_instance, img_shape, labels):
         ymax = y + 0.5*h
 
         plt.text(x, y, "X",color=c,fontsize=15)
-        plt.text(xmin, ymin, names[id_obj], color ='black', fontsize=7, backgroundcolor=c)
+        plt.text(xmin, ymin, "{} ({:.2f})".format(names[id_obj], scores[id_obj]), 
+                    color ='black', fontsize=7, backgroundcolor=c)
         plt.plot(np.array([xmin,xmin]),
-                    np.array([ymin,ymax]),color=c,linewidth=7)
+                    np.array([ymin,ymax]),color=c,linewidth=5)
         plt.plot(np.array([xmin,xmax]),
-                    np.array([ymin,ymin]),color=c,linewidth=7)
+                    np.array([ymin,ymin]),color=c,linewidth=5)
         plt.plot(np.array([xmax,xmax]),
-                    np.array([ymax,ymin]),color=c,linewidth=7)  
+                    np.array([ymax,ymin]),color=c,linewidth=5)  
         plt.plot(np.array([xmin,xmax]),
-                    np.array([ymax,ymax]),color=c,linewidth=7)
+                    np.array([ymax,ymax]),color=c,linewidth=5)
         id_obj += 1

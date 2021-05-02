@@ -3,7 +3,10 @@ import yaml
 from pathlib import Path
 from matplotlib import pyplot as plt
 
-from utils import parse_annotations, ImageReader, normalize, BestAnchorBoxFinder
+from utils import parse_annotations, ImageReader, normalize, BestAnchorBoxFinder, load_config
+from yolo import YOLO_v2, BatchGenerator
+from graphic_tools import plot_image
+
 
 def main():
     root_dir = Path(__file__).resolve().parent.parent
@@ -11,64 +14,56 @@ def main():
     ann_dir = root_dir.joinpath('data/VOCdevkit/VOC2012/Annotations')
     
     # Extract hyperparameters
-    with open(root_dir.joinpath('scripts/hyperparameters.yaml'), 'r') as fd:
-        config = yaml.load(fd, Loader=yaml.FullLoader)
-        classes = config['labels']
-        anchors = config['anchors']
+    config = load_config(root_dir.joinpath('scripts/config.yaml'))
 
-    all_imgs, seen_labels = parse_annotations(ann_dir, img_dir, labels=classes)
+    all_imgs, seen_labels = parse_annotations(ann_dir, img_dir, labels=config['labels'])
 
-    img_encoder = ImageReader(img_width=416, img_height=416, norm=normalize,
-                              grids=(13, 13))
-    print('Input..')
-    test_input = all_imgs[0]
-    for key, value in test_input.items():
-        print("\t{} : {}".format(key, value))
+    train_batch_generator = BatchGenerator(all_imgs, config, norm=normalize, shuffle=True)
+    [x_batch, b_batch], y_batch = train_batch_generator.__getitem__(idx=3)
+    
+    print("x_batch: (BATCH_SIZE, IMAGE_H, IMAGE_W, N channels)           = {}".format(x_batch.shape))
+    print("y_batch: (BATCH_SIZE, GRID_H, GRID_W, BOX, 4 + 1 + N classes) = {}".format(y_batch.shape))
+    print("b_batch: (BATCH_SIZE, 1, 1, 1, TRUE_BOX_BUFFER, 4)            = {}".format(b_batch.shape))
 
-    print('Ouput..')
-    img, all_objs = img_encoder.fit_data(test_input)
-    print('\n{}'.format(all_objs))
+    # print(".."*40)
+    # for i in range(5):
+    #     print('Image {}:'.format(i))
+    #     grid_y, grid_x, anchor_id = np.where(y_batch[i,:,:,:,4]==1) # BBoxes with 100% confidence
+        
+    #     plot_image(x_batch[i], y_batch[i], config['labels'], True)
+    #     plt.tight_layout()
+    #     plt.show()
 
-    plt.imshow(img)
-    plt.title('Image shape: {}'.format(img.shape))
-    plt.show()
+    model = YOLO_v2(config)
+    # model.summary()
+    nb_grids = 4 # Grids containing bboxes
+    hardcode_batch = np.zeros(y_batch.shape)
+    bboxes = np.random.rand(nb_grids*16).reshape(nb_grids, 4, -1) # 4 bboxes
+    scores = (np.random.rand(nb_grids*4)*0.4 + 0.5).reshape(nb_grids, 4) # Confidence between(0.4 and 0.9)
+    grids_h = np.random.randint(5, 5+int(nb_grids/2), size=nb_grids)
+    grids_w = np.random.randint(5, 5+int(nb_grids/2), size=nb_grids)
+    bboxes[:, :, 2:4] *= 4 # Increase bboxes dimensions
+    hardcode_batch[0, grids_h, grids_w, :, 0:4] = bboxes # One bbox per anchor 
+    hardcode_batch[0, grids_h, grids_w, :, 4] = scores
+    clss = np.zeros(20)
+    clss[14] = 1
+    hardcode_batch[0, grids_h, grids_w, :, 5:] = clss
+    import tensorflow as tf
+    hardcode_batch_t = tf.constant(hardcode_batch)
+    print(np.sum(hardcode_batch[0,:,:,:,5:].reshape((-1, len(clss))), axis=0))
+    model.non_max_suppression(hardcode_batch)
 
-    _ANCHORS01 = [[0.08285376, 0.13705531],
-                  [0.20850361, 0.39420716],
-                  [0.80552421, 0.77665105],
-                  [0.42194719, 0.62385487]]
-    print(".."*40)
-    print("The three example anchor boxes:")
-    count = 0
-    for w, h in _ANCHORS01:
-        print("anchor box index={}, w={}, h={}".format(count, w, h))
-        count += 1
-    print(".."*40)   
-    print("Allocate bounding box of various width and height into the three anchor boxes:")  
-    babf = BestAnchorBoxFinder(_ANCHORS01)
-    for w in range(1,9,2):
-        w /= 10.
-        for h in range(1,9,2):
-            h /= 10.
-            best_anchor,max_iou = babf.find(w,h)
-            print("bounding box (w = {}, h = {}):\n\tBbest anchor box index = {}, IOU = {:03.2f}".format(
-                w,h,best_anchor,max_iou))
 
-    obj    = {'xmin': 150, 'ymin': 84, 'xmax': 300, 'ymax': 294}
-    # config = {"IMAGE_W":416,"IMAGE_H":416,"GRID_W":13,"GRID_H":13}
-    # center_x, center_y = rescale_centerxy(obj,config)
-    # center_w, center_h = rescale_cebterwh(obj,config)
-
-    center_x, center_y, center_w, center_h = img_encoder.rescale_center_rel_grids(obj)
-    grid_w, grid_h = img_encoder.grids
-
-    print("cebter_x abd cebter_w should range between 0 and {}".format(grid_w))
-    print("cebter_y abd cebter_h should range between 0 and {}".format(grid_h))
-
-    print("center_x = {:06.3f} range between 0 and {}".format(center_x, grid_w))
-    print("center_y = {:06.3f} range between 0 and {}".format(center_y, grid_h))
-    print("center_w = {:06.3f} range between 0 and {}".format(center_w, grid_w))
-    print("center_h = {:06.3f} range between 0 and {}".format(center_h, grid_h))
+    # plot_image(x_batch[0], hardcode_batch[0], config['labels'], True, 0.5)
+    # plt.tight_layout()
+    # plt.show()
+    # print('Bboxes before reshape:\n{}\nBboxes after reshape:\n{}'.format(bboxes, bboxes.reshape(-1,4)))
+    # mask = model.class_non_max_suppression(bboxes.reshape(-1,4), scores.reshape(-1))
+    # print(mask.reshape(nb_grids, 4, -1))
+    # hardcode_batch[0, grids_h, grids_w, :, 4] = mask.reshape(nb_grids, 4)*scores
+    # plot_image(x_batch[0], hardcode_batch[0], config['labels'], True, 0.5)
+    # plt.tight_layout()
+    # plt.show()
 
 if __name__ == '__main__':
     main()

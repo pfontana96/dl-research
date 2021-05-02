@@ -9,20 +9,57 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.backend import sigmoid, exp,  sum as k_sum
 
-def calculate_loss(y_pred, y_true, true_boxes, anchors):
-    _, _, _, true_box_buffer, _ = true_boxes.shape
-    _, grid_h, grid_w, nb_anchors, _ = y_pred.shape
-     # grid coords tensor
-    coord_x = tf.cast(tf.reshape(tf.tile(tf.range(grid_w), [grid_h]), (1, grid_h, grid_w, 1, 1)), tf.float32)
-    coord_y = tf.transpose(coord_x, (0,2,1,3,4))
-    coords = tf.tile(tf.concat([coord_x,coord_y], -1), [y_pred.shape[0], 1, 1, 5, 1])
+def calculate_loss(y_pred, y_true, lambda_coord, lambda_noobj, info=False):
+    """
+    Computes YOLO Loss
+    
+    Arguments:
+    ---------
+    y_pred : [tf.Tensor] Tensor of shape (batch_size, grid_h, grid_w, nb_anchors, 5+nb_classes)
+             containing predicted values
+    y_pred : [tf.Tensor] Tensor of shape (batch_size, grid_h, grid_w, nb_anchors, 5+nb_classes)
+             containing ground truth values
+    """
+    # Get common values
+    batch_size, grid_h, grid_w, nb_anchors, _ = y_true.shape
 
-    # Coordinate loss
-    pred_xy = sigmoid(y_pred[:, :, :, :, 0:2]) # Adjust coordinates between 1 and 0
-    pred_xy += coords # Add cell coord for comparisson with ground truth. New coords in grid cell coords
-    pred_wh = exp(y_pred[:, :, :, :, 2:4])*anchors # Adjust width and height for comparisson with ground truth
+    # Get mask for indexing where there're objects detected on ground truth
+    gt_obj_mask = tf.where(y_true[:,:,:,:,4] == 1, True, False).numpy()
 
-    nb_detector_mask = k_sum()
+    # Localizaton LOSS (i.e. differences in true bboxes and the predicted ones)
+    # Calculate x,y loss
+    pred_xy = y_batch[gt_obj_mask][:,0:2]
+    true_xy = y_true[gt_obj_mask][:,0:2]
+
+    loss_xy = tf.reduce_sum(tf.reduce_sum(tf.math.square(pred_xy - true_xy), 0), 0)
+
+    # Calculate w,h loss
+    pred_wh = y_batch[gt_obj_mask][:,2:4]
+    true_wh = y_true[gt_obj_mask][:,2:4]
+    # As defined in original paper's loss, we take de square roots
+    pred_wh = tf.math.sqrt(pred_wh)
+    true_wh = tf.math.sqrt(true_wh)
+
+    loss_wh = tf.reduce_sum(tf.reduce_sum(tf.math.square(pred_wh - true_wh), 0), 0)
+
+    # Confidence LOSS (i.e. differences between anchor confidence vs ground truth(1) )
+    pred_c_obj = y_batch[gt_obj_mask][:,4]
+    true_c_obj = y_true[gt_obj_mask][:,4]   #TODO: Shouldn't this be always 1 for ground truth?
+    
+    loss_c = tf.reduce_sum(tf.math.square(pred_c_obj - true_c_obj), 0)
+    # We also account for images with no objects in them
+    pred_c_noobj = y_batch[~gt_obj_mask][:,4]
+    true_c_noobj = y_true[~gt_obj_mask][:,4]
+
+    loss_c += lambda_noobj*tf.reduce_sum(tf.math.square(pred_c_obj - true_c_obj), 0)
+
+    # Classification LOSS (i.e. class probabilities discrepancies)
+    pred_class = y_batch[gt_obj_mask][:,5:]
+    true_class = y_true[gt_obj_mask][:,5:] #TODO: Shouldn't this be always 1 for ground truth?
+    loss_p = tf.reduce_sum(tf.reduce_sum(tf.math.square(pred_class - true_class), 0), 0)
+
+    # Return total loss
+    return lambda_coord*(loss_xy + loss_wh) + loss_c + loss_p
 
 def read_bytes(weights, offset, size):
     offset += size
@@ -217,22 +254,26 @@ class ImageReader(object):
             return img
         return (img, all_objs)
 
-    def rescale_center_rel_grids(self, obj):
+    def abs2grid(self, obj):
         '''
         Rescale center relative to number of gridcells
 
         Arguments:
         ---------
         obj:     [dict] dict containing xmin, xmax, ymin, ymax
-        config : [dict] dict containing IMAGE_W, GRID_W, IMAGE_H and GRID_H
         
         Return:
         ------
-        center: 
+        center: [tup] Tupple containing (x, y, w, h) in gridcells coordinate
+                 i.e: (12.3, 6.4, 2.3, 4) 
+                      Means an object which centers lays 30% right to 12th cell origin in x,
+                      40% up (or down depending reference to origin) of 6th cell with a width
+                      of 'w' times grid's width and a height of 'h' times grid's height
         '''
 
         center_x = (obj['xmin'] + obj['xmax'])/2
         center_x = center_x / (float(self.img_w) / self.grid[0])
+        
         center_y = (obj['ymin'] + obj['ymax'])/2
         center_y = center_y / (float(self.img_h) / self.grid[1])
 
@@ -242,8 +283,7 @@ class ImageReader(object):
         center_h = (obj['ymax'] - obj['ymin']) / (float(self.img_h) / self.grid[1]) 
 
         return (center_x, center_y, center_w, center_h)
-
-
+    
 
 class BBox(object):
     def __init__(self, xmin, xmax, ymin, ymax, confidence=None, classes=None):
@@ -272,6 +312,45 @@ class BBox(object):
                                                                           self.ymin,
                                                                           self.ymax)
 
+def _interval_overlap(interval_a, interval_b):
+        """
+        Helper function for IOU calculation
+        """
+        x1, x2 = interval_a
+        x3, x4 = interval_b
+        assert((x1 <= x2) and (x3 <= x4)), "Interval's 1st component larger than 2nd one!"
+
+        if x3 < x1:
+            if x4 < x1:
+                return 0
+            else:
+                return min(x2, x4) - x1
+        else:
+            if x2 < x3:
+                return 0
+            else:
+                return min(x2, x4) - x3
+
+def IOU(bbox1, bbox2):
+        """
+        Calculates Intersection over Union of 2 Bounding boxes
+        """
+        intersect_w = _interval_overlap([bbox1.xmin, bbox1.xmax], [bbox2.xmin, bbox2.xmax])
+        intersect_h = _interval_overlap([bbox1.ymin, bbox1.ymax], [bbox2.ymin, bbox2.ymax])
+
+        intersection = intersect_w*intersect_h
+
+        w1, h1 = (bbox1.xmax - bbox1.xmin, bbox1.ymax - bbox1.ymin)
+        w2, h2 = (bbox2.xmax - bbox2.xmin, bbox2.ymax - bbox2.ymin)
+
+        union = w1*h1 + w2*h2 - intersection # -intersection because otherwise we're counting it twice
+        # print('Int: {} and Union: {}'.format(intersection, union))
+
+        if union < 1e-10: # Avoid division by zero
+            return 0
+
+        return float(intersection)/union
+
 class BestAnchorBoxFinder(object):
     """
     Finds the best anchor box for a particular object. This is done by finding the anchor box 
@@ -288,49 +367,12 @@ class BestAnchorBoxFinder(object):
         """
         self.anchors = [BBox(0, width, 0, height) for width, height in anchors]
 
-    def _interval_overlap(self, interval_a, interval_b):
-
-        x1, x2 = interval_a
-        x3, x4 = interval_b
-        assert((x1 <= x2) and (x3 <= x4)), "Interval's 1st component larger than 2nd one!"
-
-        if x3 < x1:
-            if x4 < x1:
-                return 0
-            else:
-                return min(x2, x4) - x1
-        else:
-            if x2 < x3:
-                return 0
-            else:
-                return min(x2, x4) - x3
-
-    def _IOU(self, bbox1, bbox2):
-        """
-        Calculates Intersection over Union of 2 Bounding boxes
-        """
-        intersect_w = self._interval_overlap([bbox1.xmin, bbox1.xmax], [bbox2.xmin, bbox2.xmax])
-        intersect_h = self._interval_overlap([bbox1.ymin, bbox1.ymax], [bbox2.ymin, bbox2.ymax])
-
-        intersection = intersect_w*intersect_h
-
-        w1, h1 = (bbox1.xmax - bbox1.xmin, bbox1.ymax - bbox1.ymin)
-        w2, h2 = (bbox2.xmax - bbox2.xmin, bbox2.ymax - bbox2.ymin)
-
-        union = w1*h1 + w2*h2 - intersection # -intersection because otherwise we're counting it twice
-        # print('Int: {} and Union: {}'.format(intersection, union))
-
-        if union < 1e-10: # Avoid division by zero
-            return 0
-
-        return float(intersection)/union
-
     def find(self, center_w, center_h):
         """
         Find the anchor box that best predicts this bbox
         """
         target = BBox(0, center_w, 0, center_h)
-        ious = np.frompyfunc(self._IOU, 2, 1)(self.anchors, target)
+        ious = np.frompyfunc(IOU, 2, 1)(self.anchors, target)
 
         index = np.argmax(ious)
 

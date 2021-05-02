@@ -1,6 +1,7 @@
 import numpy as np
 
-from tensorflow.nn import space_to_depth
+import tensorflow as tf
+
 from tensorflow.keras.utils import Sequence
 from tensorflow.keras import Model
 from tensorflow.keras.layers import Reshape, Activation, Conv2D, Input, MaxPooling2D, BatchNormalization, Flatten, Dense, Lambda, LeakyReLU, concatenate
@@ -9,7 +10,8 @@ from tensorflow.keras.backend import get_value, set_value
 
 from pathlib import Path
 
-from utils import BestAnchorBoxFinder, ImageReader, WeightsReader, read_bytes
+from utils import BestAnchorBoxFinder, ImageReader, WeightsReader, read_bytes, calculate_loss, BBox
+from utils import IOU
 
 class LearningRateScheduler(Callback):
     def __init__(self, schedule):
@@ -57,6 +59,10 @@ class YOLO_v2(Model):
         self.maxpools = []
         self.norms = []
         self.acts = []
+
+        self.prob_threshold = config.get('prob_t', 0.6) # Threshold for discarting predictions
+        self.iou_threshold = config.get('iou_t', 0.5) # Threshold for discarting multiple predictions of same 
+                                                      # object in non-max suppression
 
         self.nb_anchors = len(config['anchors'])
         self.nb_classes = len(config['labels'])
@@ -197,6 +203,61 @@ class YOLO_v2(Model):
         new_bias = np.random.normal(size=weights_list[1].shape)/nb_grids
         layer.set_weights([new_kernel, new_bias])  
 
+    def non_max_suppression(self, y_batch):
+        for instance in y_batch:
+            nb_obj_class = tf.reduce_sum(tf.math.ceil(tf.reshape(instance[:,:,:,5:], (-1, self.nb_classes))), 0)
+            print(nb_obj_class)
+            # class_id = 0
+            # for nb_bboxes in nb_obj_class:
+            #     if nb_bboxes:
+
+    def class_non_max_suppression(self, bboxes, scores):
+        """
+        Performs Non Max suppression over just one class
+        
+        Arguments:
+        ---------
+        bboxes: [np.array] 2D Array containing bboxes (x, y, w, h).
+        scores: [np.array] 1D Array containing confidence for each bbox. 
+        """
+        nb_bboxes = bboxes.shape[0]
+
+        ids = np.array(range(nb_bboxes)) # 
+        mask = np.zeros((nb_bboxes), dtype=bool)
+
+        # Eliminate low confidence predictions
+        index = np.where(scores >= self.prob_threshold)[0]
+        ids = ids[index]
+        bboxes = bboxes[index]
+        scores = scores[index]
+
+        # Convert bboxes class (We dont care where the center is)
+        bboxes =  np.frompyfunc(lambda w, h: BBox(0, w, 0, h), 2, 1)(bboxes[:, 2], bboxes[:, 3])
+        iou_vfunc = np.vectorize(lambda b1, b2: IOU(b1, b2))
+
+        while len(ids):
+            best_index = np.argmax(scores)
+            best_id = ids[best_index]
+            best_bbox = bboxes[best_index]
+
+            # Mark current bbox in mask
+            mask[best_id] = True
+
+            ids = np.delete(ids, best_index)
+            bboxes = np.delete(bboxes, best_index)
+
+            if not len(ids):
+                break
+
+            ious = iou_vfunc(best_bbox, bboxes)
+            remove_index = np.where(ious >= self.iou_threshold)[0]
+
+            ids = np.delete(ids, remove_index)
+            bboxes = np.delete(bboxes, remove_index)
+            scores = np.delete(scores, np.concatenate((remove_index, [best_index])))
+        
+        return mask
+
 class BatchGenerator(Sequence):
     def __init__(self, images, config, norm=None, shuffle=True):
         
@@ -237,6 +298,9 @@ class BatchGenerator(Sequence):
             y_batch[iframe,igrid_h,igrid_w,ianchor,:4] contains (center_x,center_y,center_w,center_h) 
             of ianchorth anchor at  grid cell=(igrid_h,igrid_w) if the object exists in 
             this (grid cell, anchor) pair, else they simply contain 0.
+            Bbox's center coordinates (x,y) are given between 0 and 1 relative to cell's origin 
+            (i.e. 0.4 means 40% from cell's origin) and its dimensions relative to the cell's size 
+            (i.e. 3.4 means 3.4 times the cell's grid)
 
             y_batch[iframe,igrid_h,igrid_w,ianchor,4] contains 1 if the object exists in this 
             (grid cell, anchor) pair, else it contains 0.
@@ -283,10 +347,14 @@ class BatchGenerator(Sequence):
             true_box_index = 0
             for obj in all_objs:
                 if (obj['xmax'] > obj['xmin']) and (obj['ymax'] > obj['ymin']) and (obj['name'] in self.labels):
-                    center_x, center_y, center_w, center_h = self.img_encoder.rescale_center_rel_grids(obj)
+                    center_x, center_y, center_w, center_h = self.img_encoder.abs2grid(obj)
                     
                     grid_x = int(np.floor(center_x))
                     grid_y = int(np.floor(center_y))
+
+                    # Now we save in y_batch, center position relative to cell's origin
+                    center_x -= grid_x
+                    center_y -= grid_y
 
                     if (grid_x < self.grid[0]) and (grid_y < self.grid[1]):
                         obj_idx = self.labels.tolist().index(obj['name'])
@@ -309,7 +377,7 @@ class BatchGenerator(Sequence):
                         true_box_index = (true_box_index + 1) % self.true_box_buffer
 
                 else:
-                    print("Omitting image {} because of incorrect labeling..".format(train_instance['filename']))
+                    print("Omitting image {} because of inconsistent labeling..".format(train_instance['filename']))
 
             x_batch[instance_count] = img
             instance_count += 1
@@ -324,56 +392,57 @@ class BatchGenerator(Sequence):
             np.random.shuffle(self.images)
 
 def main():
-    from utils import load_config
+    # from utils import load_config
 
-    from pathlib import Path
-
-    p = Path(__file__).resolve().parent 
-    config = load_config(p.joinpath('config.yaml'))
-
-    model = YOLO_v2(config)
-    model.summary()
-    model.load_weights_from_file(p.joinpath('yolov2.weights'))
-    # yolov2 = YOLO_v2(config)
-    # model = yolov2.get_model()
-    # model.summary()
-    
-    # w_reader = WeightsReader(p.joinpath('yolov2.weights'))
-    # w_reader.load_weights(model)
-
-    # import yaml
     # from pathlib import Path
-    # from matplotlib import pyplot as plt
 
-    # from utils import parse_annotations, normalize, load_config
-    # from graphic_tools import plot_img_with_gridcell, plot_bbox
+    # p = Path(__file__).resolve().parent 
+    # config = load_config(p.joinpath('config.yaml'))
 
-    # root_dir = Path(__file__).resolve().parent.parent
-    # img_dir = root_dir.joinpath('data/VOCdevkit/VOC2012/JPEGImages')
-    # ann_dir = root_dir.joinpath('data/VOCdevkit/VOC2012/Annotations')
-    
-    # config = load_config(root_dir.joinpath('scripts/config.yaml'))
+    # model = YOLO_v2(config)
+    # model.summary()
+    # model.load_weights_from_file(p.joinpath('yolov2.weights'))
 
-    # all_imgs, _ = parse_annotations(ann_dir, img_dir, labels=config['labels'])
-    # print("First 3 images:\n{}\n{}\n{}".format(all_imgs[0], all_imgs[1], all_imgs[2]))
-    # print(".."*40)
+    import yaml
+    from pathlib import Path
+    from matplotlib import pyplot as plt
 
-    # train_batch_generator = BatchGenerator(all_imgs, config, norm=normalize, shuffle=True)
-    # [x_batch, b_batch], y_batch = train_batch_generator.__getitem__(idx=3)
-    # print("x_batch: (BATCH_SIZE, IMAGE_H, IMAGE_W, N channels)           = {}".format(x_batch.shape))
-    # print("y_batch: (BATCH_SIZE, GRID_H, GRID_W, BOX, 4 + 1 + N classes) = {}".format(y_batch.shape))
-    # print("b_batch: (BATCH_SIZE, 1, 1, 1, TRUE_BOX_BUFFER, 4)            = {}".format(b_batch.shape))
+    from utils import parse_annotations, normalize, load_config
+    from graphic_tools import plot_image
 
-    # print(".."*40)
-    # for i in range(5):
-    #     print('Image {}:'.format(i))
-    #     img = x_batch[i]
-    #     grid_y, grid_x, anchor_id = np.where(y_batch[i,:,:,:,4]==1) # BBoxes with 100% confidence
+    root_dir = Path(__file__).resolve().parent.parent
+    img_dir = root_dir.joinpath('data/VOCdevkit/VOC2012/JPEGImages')
+    ann_dir = root_dir.joinpath('data/VOCdevkit/VOC2012/Annotations')
+
+    config = load_config(root_dir.joinpath('scripts/config.yaml'))
+
+    all_imgs, _ = parse_annotations(ann_dir, img_dir, labels=config['labels'])
+    print("First 3 images:\n{}\n{}\n{}".format(all_imgs[0], all_imgs[1], all_imgs[2]))
+    print(".."*40)
+
+    train_batch_generator = BatchGenerator(all_imgs, config, norm=normalize, shuffle=True)
+    [x_batch, b_batch], y_batch = train_batch_generator.__getitem__(idx=3)
+    print("x_batch: (BATCH_SIZE, IMAGE_H, IMAGE_W, N channels)           = {}".format(x_batch.shape))
+    print("y_batch: (BATCH_SIZE, GRID_H, GRID_W, BOX, 4 + 1 + N classes) = {}".format(y_batch.shape))
+    print("b_batch: (BATCH_SIZE, 1, 1, 1, TRUE_BOX_BUFFER, 4)            = {}".format(b_batch.shape))
+
+    print(".."*40)
+    for i in range(5):
+        print('Image {}:'.format(i))
+        grid_y, grid_x, anchor_id = np.where(y_batch[i,:,:,:,4]==1) # BBoxes with 100% confidence
         
-    #     plot_img_with_gridcell(img, config['grid'])
-    #     plot_bbox(y_batch[i], config['image_shape'], config['labels'])
-    #     plt.tight_layout()
-    #     plt.show()
+        plot_image(x_batch[i], y_batch[i], config['labels'], True)
+        plt.tight_layout()
+        plt.show()
+
+    # model = YOLO_v2(config)
+    # model.summary()
+    # model.load_weights_from_file(root_dir.joinpath('scripts/yolov2.weights'))
+    # y_pred = model.predict([x_batch, b_batch], batch_size=config['batch_size'])
+    # print(y_pred[y_pred[:,:,:,:,4]>=0.5])
+
+    # hardcode_batch = np.zeros((16, 13, 13, 4, 25))
+    # hardcode_batch[0, 6, 6, 2, ]
 
 if __name__ == '__main__':
     main()
