@@ -204,16 +204,32 @@ class YOLO_v2(Model):
         layer.set_weights([new_kernel, new_bias])  
 
     def non_max_suppression(self, y_batch):
+        count = 0
+        new_y_batch = np.zeros(y_batch.shape)
         for instance in y_batch:
-            nb_obj_class = tf.reduce_sum(tf.math.ceil(tf.reshape(instance[:,:,:,5:], (-1, self.nb_classes))), 0)
-            print(nb_obj_class)
-            # class_id = 0
-            # for nb_bboxes in nb_obj_class:
-            #     if nb_bboxes:
+            # For each instance we'll need to calculate the scores for each bounding box predicted
+            # As we're predicting Pc and C1, C2, ..., Cn as the scores will be calculated as follow
+            # score = Pc*Ci = P(Classi|Object)*P(Object)
+            scores = tf.multiply(tf.reshape(instance[:,:,:,5:], (-1, self.nb_classes)),
+                                tf.reshape(instance[:,:,:,4], (-1,1))).numpy()
+            
+            scores = np.where(scores == np.max(scores, axis=1, keepdims=True), scores, 0)
 
-    def class_non_max_suppression(self, bboxes, scores):
+            bboxes = tf.reshape(instance[:,:,:,0:4], (-1, 4)).numpy()
+
+            for class_id in range(self.nb_classes):
+                mask = self.instance_non_max_suppression(bboxes, scores[:, class_id])
+                mask = mask.reshape(self.grid[1], self.grid[0], self.nb_anchors)
+
+                new_y_batch[count, mask] = instance[mask]
+
+            count += 1
+
+        return tf.constant(new_y_batch)    
+
+    def instance_non_max_suppression(self, bboxes, scores):
         """
-        Performs Non Max suppression over just one class
+        Performs Non Max suppression over just one instance
         
         Arguments:
         ---------
@@ -230,7 +246,6 @@ class YOLO_v2(Model):
         ids = ids[index]
         bboxes = bboxes[index]
         scores = scores[index]
-
         # Convert bboxes class (We dont care where the center is)
         bboxes =  np.frompyfunc(lambda w, h: BBox(0, w, 0, h), 2, 1)(bboxes[:, 2], bboxes[:, 3])
         iou_vfunc = np.vectorize(lambda b1, b2: IOU(b1, b2))
@@ -265,6 +280,7 @@ class BatchGenerator(Sequence):
 
         self.true_box_buffer = config['true_box_buffer'] # Maximun objects per box!!
         self.batch_size = config['batch_size']
+        self.anchors = config['anchors']
         self.nb_anchors = len(config['anchors'])
 
         self.best_anc_finder = BestAnchorBoxFinder(config['anchors'])
@@ -338,6 +354,9 @@ class BatchGenerator(Sequence):
         y_batch = np.zeros((r_bound - l_bound, self.grid[1], self.grid[0],
                             self.nb_anchors, 5+len(self.labels)))
         b_batch = np.zeros((r_bound - l_bound, 1, 1, 1, self.true_box_buffer, 4))
+          
+        grid_width = float(self.img_w)/self.grid[0] 
+        grid_height = float(self.img_h)/self.grid[1]
 
         for train_instance in self.images[l_bound:r_bound]:
             # Resize image
@@ -359,12 +378,19 @@ class BatchGenerator(Sequence):
                     if (grid_x < self.grid[0]) and (grid_y < self.grid[1]):
                         obj_idx = self.labels.tolist().index(obj['name'])
 
-                        bbox = [center_x, center_y, center_w, center_h]
                         best_anchor_id, max_iou = self.best_anc_finder.find(center_w, center_h)
                         # Assign ground truth x, y, w, h, confidence and class probs to y_batch
                         # it could happen that the same grid cell contain 2 similar shape objects
                         # as a result the same anchor box is selected as the best anchor box by the multiple objects
                         # in such ase, the object is over written
+                        
+                        # As stated in paper, width and height are predicted
+                        # relative to anchor's dimensions 
+                        
+                        center_w = center_w*(grid_width/self.anchors[best_anchor_id, 0])
+                        center_h = center_h*(grid_height/self.anchors[best_anchor_id, 1])
+                        
+                        bbox = [center_x, center_y, center_w, center_h]
 
                         # center_x, center_y, w, h and 1 because ground truth confidence is always 1
                         y_batch[instance_count, grid_y, grid_x, best_anchor_id, 0:4] = bbox

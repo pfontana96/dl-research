@@ -30,7 +30,7 @@ def main():
     #     print('Image {}:'.format(i))
     #     grid_y, grid_x, anchor_id = np.where(y_batch[i,:,:,:,4]==1) # BBoxes with 100% confidence
         
-    #     plot_image(x_batch[i], y_batch[i], config['labels'], True)
+    #     plot_image(x_batch[i], y_batch[i], config['anchors'], config['labels'], True)
     #     plt.tight_layout()
     #     plt.show()
 
@@ -39,31 +39,28 @@ def main():
     nb_grids = 4 # Grids containing bboxes
     hardcode_batch = np.zeros(y_batch.shape)
     bboxes = np.random.rand(nb_grids*16).reshape(nb_grids, 4, -1) # 4 bboxes
-    scores = (np.random.rand(nb_grids*4)*0.4 + 0.5).reshape(nb_grids, 4) # Confidence between(0.4 and 0.9)
+    scores = (np.random.rand(nb_grids*4)*0.5 + 0.5).reshape(nb_grids, 4) # Confidence between(0.4 and 0.9)
     grids_h = np.random.randint(5, 5+int(nb_grids/2), size=nb_grids)
     grids_w = np.random.randint(5, 5+int(nb_grids/2), size=nb_grids)
-    bboxes[:, :, 2:4] *= 4 # Increase bboxes dimensions
+    bboxes[:, :, 2:4] *= 16 # Increase bboxes dimensions
     hardcode_batch[0, grids_h, grids_w, :, 0:4] = bboxes # One bbox per anchor 
     hardcode_batch[0, grids_h, grids_w, :, 4] = scores
-    clss = np.zeros(20)
-    clss[14] = 1
+    clss = (np.random.rand(nb_grids*4*20)*0.5 + 0.5).reshape(4, 4, 20)
+    # clss = np.zeros((4, 4, 20))
+    # clss[:,:,5+10] = (np.random.rand(nb_grids*4)*0.5 +0.5).reshape(4, 4)
     hardcode_batch[0, grids_h, grids_w, :, 5:] = clss
+    plot_image(x_batch[0], hardcode_batch[0], config['anchors'], config['labels'])
+    plt.show()
+
     import tensorflow as tf
+    from time import time
     hardcode_batch_t = tf.constant(hardcode_batch)
-    print(np.sum(hardcode_batch[0,:,:,:,5:].reshape((-1, len(clss))), axis=0))
-    model.non_max_suppression(hardcode_batch)
-
-
-    # plot_image(x_batch[0], hardcode_batch[0], config['labels'], True, 0.5)
-    # plt.tight_layout()
-    # plt.show()
-    # print('Bboxes before reshape:\n{}\nBboxes after reshape:\n{}'.format(bboxes, bboxes.reshape(-1,4)))
-    # mask = model.class_non_max_suppression(bboxes.reshape(-1,4), scores.reshape(-1))
-    # print(mask.reshape(nb_grids, 4, -1))
-    # hardcode_batch[0, grids_h, grids_w, :, 4] = mask.reshape(nb_grids, 4)*scores
-    # plot_image(x_batch[0], hardcode_batch[0], config['labels'], True, 0.5)
-    # plt.tight_layout()
-    # plt.show()
+    s = time()
+    new_batch = model.non_max_suppression(hardcode_batch_t)
+    e = time()
+    print('Time elapsed: {} s'.format(e-s))
+    plot_image(x_batch[0], new_batch[0].numpy(), config['anchors'], config['labels'])
+    plt.show()
 
 if __name__ == '__main__':
     main()

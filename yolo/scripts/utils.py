@@ -331,25 +331,44 @@ def _interval_overlap(interval_a, interval_b):
             else:
                 return min(x2, x4) - x3
 
+def calculate_IOU(bbox1, bbox2):
+    """
+    This function is agnostic of where the center is located! 
+    """
+    w1, h1 = bbox1
+    w2, h2 = bbox2
+    intersect_w = _interval_overlap([0, w1], [0, w2])
+    intersect_h = _interval_overlap([0, h1], [0, w2])
+
+    intersection = intersect_w*intersect_h
+
+    union = w1*h1 + w2*h2 - intersection # -intersection because otherwise we're counting it twice
+    # print('Int: {} and Union: {}'.format(intersection, union))
+
+    if union < 1e-10: # Avoid division by zero
+        return 0
+
+    return float(intersection)/union
+
 def IOU(bbox1, bbox2):
-        """
-        Calculates Intersection over Union of 2 Bounding boxes
-        """
-        intersect_w = _interval_overlap([bbox1.xmin, bbox1.xmax], [bbox2.xmin, bbox2.xmax])
-        intersect_h = _interval_overlap([bbox1.ymin, bbox1.ymax], [bbox2.ymin, bbox2.ymax])
+    """
+    Calculates Intersection over Union of 2 Bounding boxes
+    """
+    intersect_w = _interval_overlap([bbox1.xmin, bbox1.xmax], [bbox2.xmin, bbox2.xmax])
+    intersect_h = _interval_overlap([bbox1.ymin, bbox1.ymax], [bbox2.ymin, bbox2.ymax])
 
-        intersection = intersect_w*intersect_h
+    intersection = intersect_w*intersect_h
 
-        w1, h1 = (bbox1.xmax - bbox1.xmin, bbox1.ymax - bbox1.ymin)
-        w2, h2 = (bbox2.xmax - bbox2.xmin, bbox2.ymax - bbox2.ymin)
+    w1, h1 = (bbox1.xmax - bbox1.xmin, bbox1.ymax - bbox1.ymin)
+    w2, h2 = (bbox2.xmax - bbox2.xmin, bbox2.ymax - bbox2.ymin)
 
-        union = w1*h1 + w2*h2 - intersection # -intersection because otherwise we're counting it twice
-        # print('Int: {} and Union: {}'.format(intersection, union))
+    union = w1*h1 + w2*h2 - intersection # -intersection because otherwise we're counting it twice
+    # print('Int: {} and Union: {}'.format(intersection, union))
 
-        if union < 1e-10: # Avoid division by zero
-            return 0
+    if union < 1e-10: # Avoid division by zero
+        return 0
 
-        return float(intersection)/union
+    return float(intersection)/union
 
 class BestAnchorBoxFinder(object):
     """
