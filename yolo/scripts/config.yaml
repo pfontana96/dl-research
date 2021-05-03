@@ -1,0 +1,35 @@
+labels:
+  - aeroplane
+  - bicycle
+  - bird
+  - boat
+  - bottle
+  - bus
+  - car
+  - cat
+  - chair
+  - cow
+  - diningtable
+  - dog
+  - horse
+  - motorbike
+  - person
+  - pottedplant
+  - sheep
+  - sofa
+  - train
+  - tvmonitor
+
+anchors:
+  - [1.07709888,  1.78171903]  # Anchor box 1 (width and height)
+  - [2.71054693,  5.12469308]  # Anchor box 2 (width and height)
+  - [10.47181473, 10.09646365] # Anchor box 3 (width and height)
+  - [5.48531347,  8.11011331]  # Anchor box 4 (width and height)
+
+image_shape: [416, 416] # Image size!
+
+grid: [13, 13] # Number of gridcells
+
+batch_size: 16
+
+true_box_buffer: 50
