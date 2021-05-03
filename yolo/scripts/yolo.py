@@ -10,8 +10,87 @@ from tensorflow.keras.backend import get_value, set_value
 
 from pathlib import Path
 
-from utils import BestAnchorBoxFinder, ImageReader, WeightsReader, read_bytes, calculate_loss, BBox
-from utils import IOU
+from utils import ImageReader, WeightsReader, read_bytes, calculate_IOU
+
+def adjust_yolo_output(y_pred):
+    """
+    As stated in the original paper, YOLO predicts a bounding box as, relative to the gridcell's
+    origin (cx, cy) and anchor box chosen (pw, ph):
+        (tx, ty, tw, th, to)
+    where:
+        bx = sigmoid(tx) + cx
+        by = sigmoid(ty) + cy
+        bw = pw*exp(tw)
+        bh = ph*exp(th)
+        Pr(obj)*IOU(b,obj) = sigmoid(to)
+    """
+    batch_size, grid_y, grid_x, nb_anchors, output_dim = y_pred.shape
+    y_pred = tf.reshape(y_pred, (-1, output_dim))
+    pred_xy = tf.sigmoid(y_pred[:, 0:2])
+    pred_wh = tf.exp(y_pred[:, 2:4])
+    pred_p = tf.reshape(tf.sigmoid(y_pred[:, 4]), (-1,1))
+
+    output = tf.concat([pred_xy, pred_wh, pred_p, y_pred[:,5:]], axis=1)
+    
+    return tf.reshape(output, (batch_size, grid_y, grid_x, nb_anchors, output_dim))
+
+def yolo_loss(lambda_coord, lambda_noobj):
+    # Hack to allow for additional parameters when defining a keras loss function
+    def calculate_loss(y_true, y_pred):
+        """
+        Computes YOLO Loss
+        
+        Arguments:
+        ---------
+        y_pred : [tf.Tensor] Tensor of shape (batch_size, grid_h, grid_w, nb_anchors, 5+nb_classes)
+                containing predicted values
+        y_pred : [tf.Tensor] Tensor of shape (batch_size, grid_h, grid_w, nb_anchors, 5+nb_classes)
+                containing ground truth values
+        """
+        # Convert network's output
+        y_pred = adjust_yolo_output(y_pred)
+
+        # Get common values
+        batch_size, grid_h, grid_w, nb_anchors, _ = y_true.shape
+
+        # Get mask for indexing where there're objects detected on ground truth
+        gt_obj_mask = tf.where(y_true[:,:,:,:,4] == 1, True, False).numpy()
+
+        # Localizaton LOSS (i.e. differences in true bboxes and the predicted ones)
+        # Calculate x,y loss
+        pred_xy = y_pred[gt_obj_mask][:,0:2]
+        true_xy = y_true[gt_obj_mask][:,0:2]
+
+        loss_xy = tf.reduce_sum(tf.reduce_sum(tf.math.square(pred_xy - true_xy), 0), 0)
+
+        # Calculate w,h loss
+        pred_wh = y_pred[gt_obj_mask][:,2:4]
+        true_wh = y_true[gt_obj_mask][:,2:4]
+        # As defined in original paper's loss, we take de square roots
+        pred_wh = tf.math.sqrt(pred_wh)
+        true_wh = tf.math.sqrt(true_wh)
+
+        loss_wh = tf.reduce_sum(tf.reduce_sum(tf.math.square(pred_wh - true_wh), 0), 0)
+
+        # Confidence LOSS (i.e. differences between anchor confidence vs ground truth(1) )
+        pred_c_obj = y_pred[gt_obj_mask][:,4]
+        true_c_obj = y_true[gt_obj_mask][:,4]   #TODO: Shouldn't this be always 1 for ground truth?
+        
+        loss_c = tf.reduce_sum(tf.math.square(pred_c_obj - true_c_obj), 0)
+        # We also account for images with no objects in them
+        pred_c_noobj = y_pred[~gt_obj_mask][:,4]
+        true_c_noobj = y_true[~gt_obj_mask][:,4]
+
+        loss_c += lambda_noobj*tf.reduce_sum(tf.math.square(pred_c_obj - true_c_obj), 0)
+
+        # Classification LOSS (i.e. class probabilities discrepancies)
+        pred_class = y_pred[gt_obj_mask][:,5:]
+        true_class = y_true[gt_obj_mask][:,5:] #TODO: Shouldn't this be always 1 for ground truth?
+        loss_p = tf.reduce_sum(tf.reduce_sum(tf.math.square(pred_class - true_class), 0), 0)
+
+        # Return total loss
+        return lambda_coord*(loss_xy + loss_wh) + loss_c + loss_p
+    return calculate_loss
 
 class LearningRateScheduler(Callback):
     def __init__(self, schedule):
@@ -47,7 +126,8 @@ class LearningRateScheduler(Callback):
 
 # the function to implement the orgnization layer (thanks to https://github.com/allanzelener/YAD2K)
 def space_to_depth_x2(x):
-    return space_to_depth(x, block_size=2)
+    import tensorflow as tf 
+    return tf.nn.space_to_depth(x, block_size=2)
 
 class YOLO_v2(Model):
     """
@@ -66,7 +146,7 @@ class YOLO_v2(Model):
 
         self.nb_anchors = len(config['anchors'])
         self.nb_classes = len(config['labels'])
-        self.true_box_buffer = config['true_box_buffer']
+        # self.true_box_buffer = config['true_box_buffer']
 
         self.img_shape = config['image_shape']
         self.grid = config['grid']
@@ -102,13 +182,9 @@ class YOLO_v2(Model):
 
             l_id += 1
         
-        self.lambda_1 = Lambda(space_to_depth_x2)
-        # small hack to allow true_boxes to be registered when Keras build the model 
-        # for more information: https://github.com/fchollet/keras/issues/2790
-        self.lambda_2 = Lambda(lambda args: args[0])
-        
     def call(self, inputs, training=False):
-        x, true_boxes = inputs
+        # x, true_boxes = inputs
+        x = inputs
         mp_id = 0
         for l_id in range(len(self.convs)-1):
             if l_id != self.skipped_connections[1]:
@@ -127,23 +203,16 @@ class YOLO_v2(Model):
                 skip_connection = self.convs[l_id](skip_connection)
                 skip_connection = self.norms[l_id](skip_connection)
                 skip_connection = self.acts[l_id](skip_connection)
-                skip_connection = self.lambda_1(skip_connection)
+                # skip_connection = self.lambda_1(skip_connection)
+                skip_connection = Lambda(space_to_depth_x2)(skip_connection)
                 x = concatenate([skip_connection, x])
 
         # 23rd Layer does not have an activation nor normalization
         x = self.convs[len(self.convs)-1](x)
 
         output = Reshape((self.grid[1], self.grid[0], self.nb_anchors, 5+self.nb_classes))(x)
-        output = self.lambda_2([output, true_boxes])
         
         return output   
-
-    def summary(self):
-        # Hack for being able to see built model
-        x = Input(shape=(self.img_shape[1], self.img_shape[1], 3))
-        true_boxes = Input(shape=(1, 1, 1, self.true_box_buffer , 4))
-
-        return Model(inputs=[x, true_boxes], outputs=self.call([x, true_boxes])).summary()
 
     def load_weights_from_file(self, filename):
         """
@@ -201,89 +270,18 @@ class YOLO_v2(Model):
 
         new_kernel = np.random.normal(size=weights_list[0].shape)/nb_grids
         new_bias = np.random.normal(size=weights_list[1].shape)/nb_grids
-        layer.set_weights([new_kernel, new_bias])  
+        layer.set_weights([new_kernel, new_bias])
 
-    def non_max_suppression(self, y_batch):
-        count = 0
-        new_y_batch = np.zeros(y_batch.shape)
-        for instance in y_batch:
-            # For each instance we'll need to calculate the scores for each bounding box predicted
-            # As we're predicting Pc and C1, C2, ..., Cn as the scores will be calculated as follow
-            # score = Pc*Ci = P(Classi|Object)*P(Object)
-            scores = tf.multiply(tf.reshape(instance[:,:,:,5:], (-1, self.nb_classes)),
-                                tf.reshape(instance[:,:,:,4], (-1,1))).numpy()
-            
-            scores = np.where(scores == np.max(scores, axis=1, keepdims=True), scores, 0)
-
-            bboxes = tf.reshape(instance[:,:,:,0:4], (-1, 4)).numpy()
-
-            for class_id in range(self.nb_classes):
-                mask = self.instance_non_max_suppression(bboxes, scores[:, class_id])
-                mask = mask.reshape(self.grid[1], self.grid[0], self.nb_anchors)
-
-                new_y_batch[count, mask] = instance[mask]
-
-            count += 1
-
-        return tf.constant(new_y_batch)    
-
-    def instance_non_max_suppression(self, bboxes, scores):
-        """
-        Performs Non Max suppression over just one instance
-        
-        Arguments:
-        ---------
-        bboxes: [np.array] 2D Array containing bboxes (x, y, w, h).
-        scores: [np.array] 1D Array containing confidence for each bbox. 
-        """
-        nb_bboxes = bboxes.shape[0]
-
-        ids = np.array(range(nb_bboxes)) # 
-        mask = np.zeros((nb_bboxes), dtype=bool)
-
-        # Eliminate low confidence predictions
-        index = np.where(scores >= self.prob_threshold)[0]
-        ids = ids[index]
-        bboxes = bboxes[index]
-        scores = scores[index]
-        # Convert bboxes class (We dont care where the center is)
-        bboxes =  np.frompyfunc(lambda w, h: BBox(0, w, 0, h), 2, 1)(bboxes[:, 2], bboxes[:, 3])
-        iou_vfunc = np.vectorize(lambda b1, b2: IOU(b1, b2))
-
-        while len(ids):
-            best_index = np.argmax(scores)
-            best_id = ids[best_index]
-            best_bbox = bboxes[best_index]
-
-            # Mark current bbox in mask
-            mask[best_id] = True
-
-            ids = np.delete(ids, best_index)
-            bboxes = np.delete(bboxes, best_index)
-
-            if not len(ids):
-                break
-
-            ious = iou_vfunc(best_bbox, bboxes)
-            remove_index = np.where(ious >= self.iou_threshold)[0]
-
-            ids = np.delete(ids, remove_index)
-            bboxes = np.delete(bboxes, remove_index)
-            scores = np.delete(scores, np.concatenate((remove_index, [best_index])))
-        
-        return mask
 
 class BatchGenerator(Sequence):
     def __init__(self, images, config, norm=None, shuffle=True):
         
         self.images = images
 
-        self.true_box_buffer = config['true_box_buffer'] # Maximun objects per box!!
+        # self.true_box_buffer = config['true_box_buffer'] # Maximun objects per box!!
         self.batch_size = config['batch_size']
         self.anchors = config['anchors']
         self.nb_anchors = len(config['anchors'])
-
-        self.best_anc_finder = BestAnchorBoxFinder(config['anchors'])
         
         self.img_w, self.img_h = config['image_shape']
         self.grid = config['grid']
@@ -353,10 +351,13 @@ class BatchGenerator(Sequence):
         x_batch = np.zeros((r_bound - l_bound, self.img_h, self.img_w, 3)) # Input images
         y_batch = np.zeros((r_bound - l_bound, self.grid[1], self.grid[0],
                             self.nb_anchors, 5+len(self.labels)))
-        b_batch = np.zeros((r_bound - l_bound, 1, 1, 1, self.true_box_buffer, 4))
+        # b_batch = np.zeros((r_bound - l_bound, 1, 1, 1, self.true_box_buffer, 4))
           
         grid_width = float(self.img_w)/self.grid[0] 
         grid_height = float(self.img_h)/self.grid[1]
+
+        iou_vfunc = np.frompyfunc(lambda w1, h1, w2, h2: calculate_IOU(
+                                np.array([w1, h1]), np.array([w2, h2])), 4, 1)
 
         for train_instance in self.images[l_bound:r_bound]:
             # Resize image
@@ -378,7 +379,9 @@ class BatchGenerator(Sequence):
                     if (grid_x < self.grid[0]) and (grid_y < self.grid[1]):
                         obj_idx = self.labels.tolist().index(obj['name'])
 
-                        best_anchor_id, max_iou = self.best_anc_finder.find(center_w, center_h)
+                        ious = iou_vfunc(self.anchors[:,0], self.anchors[:,1], center_w, center_h)
+                        best_anchor_id = np.argmax(ious)
+
                         # Assign ground truth x, y, w, h, confidence and class probs to y_batch
                         # it could happen that the same grid cell contain 2 similar shape objects
                         # as a result the same anchor box is selected as the best anchor box by the multiple objects
@@ -399,8 +402,8 @@ class BatchGenerator(Sequence):
                         y_batch[instance_count, grid_y, grid_x, best_anchor_id, 5+obj_idx] = 1
 
                         # Assign the true bbox to b_batch
-                        b_batch[instance_count, 0, 0, 0, true_box_index] = bbox
-                        true_box_index = (true_box_index + 1) % self.true_box_buffer
+                        # b_batch[instance_count, 0, 0, 0, true_box_index] = bbox
+                        # true_box_index = (true_box_index + 1) % self.true_box_buffer
 
                 else:
                     print("Omitting image {} because of inconsistent labeling..".format(train_instance['filename']))
@@ -408,25 +411,17 @@ class BatchGenerator(Sequence):
             x_batch[instance_count] = img
             instance_count += 1
 
-        return [x_batch, b_batch], y_batch
+        # return [x_batch, b_batch], y_batch
+        return x_batch, y_batch
 
     def __len__(self):
-        return np.ceil(float(len(self.images))/self.batch_size)
+        return int(np.ceil(float(len(self.images))/self.batch_size))
 
     def on_epoch_end(self):
         if self.shuffle:
-            np.random.shuffle(self.images)
+            np.random.shuffle(self.images)        
 
 def main():
-    # from utils import load_config
-
-    # from pathlib import Path
-
-    # p = Path(__file__).resolve().parent 
-    # config = load_config(p.joinpath('config.yaml'))
-
-    # model = YOLO_v2(config)
-    # model.summary()
     # model.load_weights_from_file(p.joinpath('yolov2.weights'))
 
     import yaml
@@ -447,28 +442,18 @@ def main():
     print(".."*40)
 
     train_batch_generator = BatchGenerator(all_imgs, config, norm=normalize, shuffle=True)
-    [x_batch, b_batch], y_batch = train_batch_generator.__getitem__(idx=3)
+    x_batch, y_batch = train_batch_generator.__getitem__(idx=3)
     print("x_batch: (BATCH_SIZE, IMAGE_H, IMAGE_W, N channels)           = {}".format(x_batch.shape))
     print("y_batch: (BATCH_SIZE, GRID_H, GRID_W, BOX, 4 + 1 + N classes) = {}".format(y_batch.shape))
-    print("b_batch: (BATCH_SIZE, 1, 1, 1, TRUE_BOX_BUFFER, 4)            = {}".format(b_batch.shape))
 
     print(".."*40)
     for i in range(5):
         print('Image {}:'.format(i))
         grid_y, grid_x, anchor_id = np.where(y_batch[i,:,:,:,4]==1) # BBoxes with 100% confidence
         
-        plot_image(x_batch[i], y_batch[i], config['labels'], True)
+        plot_image(x_batch[i], y_batch[i], config['anchors'],config['labels'])
         plt.tight_layout()
         plt.show()
-
-    # model = YOLO_v2(config)
-    # model.summary()
-    # model.load_weights_from_file(root_dir.joinpath('scripts/yolov2.weights'))
-    # y_pred = model.predict([x_batch, b_batch], batch_size=config['batch_size'])
-    # print(y_pred[y_pred[:,:,:,:,4]>=0.5])
-
-    # hardcode_batch = np.zeros((16, 13, 13, 4, 25))
-    # hardcode_batch[0, 6, 6, 2, ]
 
 if __name__ == '__main__':
     main()

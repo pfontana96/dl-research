@@ -21,10 +21,6 @@ labels:
   - tvmonitor
 
 anchors:
-  # - [0.08285376, 0.13705531]
-  # - [0.20850361, 0.39420716]
-  # - [0.80552421, 0.77665105]
-  # - [0.42194719, 0.62385487]
   - [1.07709888,  1.78171903]  # Anchor box 1 (width and height)
   - [2.71054693,  5.12469308]  # Anchor box 2 (width and height)
   - [10.47181473, 10.09646365] # Anchor box 3 (width and height)

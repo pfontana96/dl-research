@@ -5,61 +5,106 @@ import cv2
 from copy import deepcopy
 
 import numpy as np
-
 import tensorflow as tf
-from tensorflow.keras.backend import sigmoid, exp,  sum as k_sum
 
-def calculate_loss(y_pred, y_true, lambda_coord, lambda_noobj, info=False):
-    """
-    Computes YOLO Loss
+def non_max_suppression(y_batch, iou_threshold, prob_threshold):
+    count = 0
+    new_y_batch = np.zeros(y_batch.shape)
+    _, grid_y, grid_x, nb_anchors, nb_classes = y_batch.shape 
+    nb_classes -= 5 # (x, y, w, h)
+    nb_bboxes = grid_y*grid_x*nb_anchors
+
+    iou_vfunc = np.frompyfunc(lambda x1, x2, x3, x4: calculate_IOU(
+                            np.array([x1, x2]), np.array([x3, x4])), 
+                            4, 1)
+    for instance in y_batch:
+        # For each instance we'll need to calculate the scores for each bounding box predicted
+        # As we're predicting Pc and C1, C2, ..., Cn as the scores will be calculated as follow
+        # score = Pc*Ci = P(Classi|Object)*P(Object)
+        scores = tf.multiply(tf.reshape(instance[:,:,:,5:], (-1, nb_classes)),
+                            tf.reshape(instance[:,:,:,4], (-1,1))).numpy()
+        
+        scores = np.where(scores == np.max(scores, axis=1, keepdims=True), scores, 0)
+
+        bboxes = tf.reshape(instance[:,:,:,2:4], (-1, 2)).numpy()
+
+        for class_id in range(nb_classes):
+            # mask = self.instance_non_max_suppression(bboxes, scores[:, class_id])
+            ids = np.array(range(nb_bboxes))
+            mask = np.zeros((nb_bboxes), dtype=bool)
+            c_scores = scores[:, class_id]
+            c_bboxes = bboxes
+
+            # Eliminate low confidence predictions
+            index = np.where(c_scores >= prob_threshold)[0]
+            ids = ids[index]
+            c_bboxes = c_bboxes[index]
+            c_scores = c_scores[index]
+
+            while len(ids):
+                best_index = np.argmax(c_scores)
+                best_id = ids[best_index]
+                best_bbox = c_bboxes[best_index]
+
+                # Mark current bbox in mask
+                mask[best_id] = True
+
+                ids = np.delete(ids, best_index)
+                c_bboxes = np.delete(c_bboxes, best_index, axis=0)
+
+                if not len(ids):
+                    break
+                    
+                ious = iou_vfunc(best_bbox[0], best_bbox[1], c_bboxes[:,0], c_bboxes[:,1])
+                remove_index = np.where(ious >= iou_threshold)[0]
+
+                ids = np.delete(ids, remove_index)
+                c_bboxes = np.delete(c_bboxes, remove_index, axis=0)
+                c_scores = np.delete(c_scores, np.concatenate((remove_index, [best_index])))
+
+            mask = mask.reshape(grid_y, grid_x, nb_anchors)
+
+            new_y_batch[count, mask] = instance[mask]
+
+        count += 1
+
+    return tf.constant(new_y_batch)    
+
+def tf_non_max_suppression(y_batch, iou_threshold, prob_threshold):
+    count = 0
+    batch_size, grid_y, grid_x, nb_anchors, nb_classes = y_batch.shape
+    nb_classes -= 5 # (x, y, w, h, pr)
+    new_y_batch = np.zeros(y_batch.shape, dtype=float)
+    # nms_vfunc = np.frompyfunc(lambda scrs: self.instance_non_max_suppression(bboxes, scrs), 
+    #                           self.grid[0]*self.grid[1]*self.nb_anchors, 1)
+    nb_bboxes = grid_y*grid_x*nb_anchors
+    dummy_center = tf.zeros((nb_bboxes, 2), dtype=tf.float32)
+    for instance in y_batch:
+        # For each instance we'll need to calculate the scores for each bounding box predicted
+        # As we're predicting Pc and C1, C2, ..., Cn as the scores will be calculated as follow
+        # score = Pc*Ci = P(Classi|Object)*P(Object)
+        scores = tf.multiply(tf.reshape(instance[:,:,:,5:], (-1, nb_classes)),
+                            tf.reshape(instance[:,:,:,4], (-1,1)))
+        
+        scores = tf.cast(tf.where(scores == tf.reduce_max(scores, axis=1, keepdims=True), scores, 0),
+                        tf.float32)
     
-    Arguments:
-    ---------
-    y_pred : [tf.Tensor] Tensor of shape (batch_size, grid_h, grid_w, nb_anchors, 5+nb_classes)
-             containing predicted values
-    y_pred : [tf.Tensor] Tensor of shape (batch_size, grid_h, grid_w, nb_anchors, 5+nb_classes)
-             containing ground truth values
-    """
-    # Get common values
-    batch_size, grid_h, grid_w, nb_anchors, _ = y_true.shape
+        bboxes = tf.cast(tf.reshape(instance[:,:,:,2:4], (-1, 2)), tf.float32)
+        bboxes = tf.concat([dummy_center, bboxes], axis=1)
 
-    # Get mask for indexing where there're objects detected on ground truth
-    gt_obj_mask = tf.where(y_true[:,:,:,:,4] == 1, True, False).numpy()
 
-    # Localizaton LOSS (i.e. differences in true bboxes and the predicted ones)
-    # Calculate x,y loss
-    pred_xy = y_batch[gt_obj_mask][:,0:2]
-    true_xy = y_true[gt_obj_mask][:,0:2]
+        for class_id in range(nb_classes):
+            mask = np.zeros(nb_bboxes, dtype=bool)
+            index = tf.image.non_max_suppression(bboxes, scores[:, class_id], 30,
+                    iou_threshold=iou_threshold, score_threshold=prob_threshold) # 30 max objects detected per image
+            mask[index.numpy()] = True
+            mask = mask.reshape(grid_x, grid_y, nb_anchors)
 
-    loss_xy = tf.reduce_sum(tf.reduce_sum(tf.math.square(pred_xy - true_xy), 0), 0)
+            new_y_batch[count, mask] = instance[mask]
 
-    # Calculate w,h loss
-    pred_wh = y_batch[gt_obj_mask][:,2:4]
-    true_wh = y_true[gt_obj_mask][:,2:4]
-    # As defined in original paper's loss, we take de square roots
-    pred_wh = tf.math.sqrt(pred_wh)
-    true_wh = tf.math.sqrt(true_wh)
+        count += 1
 
-    loss_wh = tf.reduce_sum(tf.reduce_sum(tf.math.square(pred_wh - true_wh), 0), 0)
-
-    # Confidence LOSS (i.e. differences between anchor confidence vs ground truth(1) )
-    pred_c_obj = y_batch[gt_obj_mask][:,4]
-    true_c_obj = y_true[gt_obj_mask][:,4]   #TODO: Shouldn't this be always 1 for ground truth?
-    
-    loss_c = tf.reduce_sum(tf.math.square(pred_c_obj - true_c_obj), 0)
-    # We also account for images with no objects in them
-    pred_c_noobj = y_batch[~gt_obj_mask][:,4]
-    true_c_noobj = y_true[~gt_obj_mask][:,4]
-
-    loss_c += lambda_noobj*tf.reduce_sum(tf.math.square(pred_c_obj - true_c_obj), 0)
-
-    # Classification LOSS (i.e. class probabilities discrepancies)
-    pred_class = y_batch[gt_obj_mask][:,5:]
-    true_class = y_true[gt_obj_mask][:,5:] #TODO: Shouldn't this be always 1 for ground truth?
-    loss_p = tf.reduce_sum(tf.reduce_sum(tf.math.square(pred_class - true_class), 0), 0)
-
-    # Return total loss
-    return lambda_coord*(loss_xy + loss_wh) + loss_c + loss_p
+    return tf.constant(new_y_batch)  
 
 def read_bytes(weights, offset, size):
     offset += size
@@ -121,8 +166,6 @@ def parse_annotations(ann_dir, img_dir, labels=[]):
 
     all_imgs = []
     seen_labels = {}
-
-    
 
     for ann in sorted(ann_dir.iterdir()):
         if ann.suffix != ".xml":
@@ -283,34 +326,6 @@ class ImageReader(object):
         center_h = (obj['ymax'] - obj['ymin']) / (float(self.img_h) / self.grid[1]) 
 
         return (center_x, center_y, center_w, center_h)
-    
-
-class BBox(object):
-    def __init__(self, xmin, xmax, ymin, ymax, confidence=None, classes=None):
-        assert((xmin < xmax) and (ymin < ymax)), "BBox dimensions do not make sense"
-        self.xmin, self.xmax = (xmin, xmax)
-        self.ymin, self.ymax = (ymin, ymax)
-
-        self.confidence = confidence
-
-        # classes probabilities [C1, C2, .., Cn]
-        self.set_class(classes)
-
-    def set_class(self, classes):
-        self.classes = classes
-        self.label = np.argmax(self.classes)
-
-    def get_label(self):
-        return self.label
-
-    def get_score(self):
-        return self.classes[self.label]
-
-    def __str__(self):
-        return "BBox:\n\txmin: {}   xmax:{}\n\tymin: {}   ymax:{}".format(self.xmin,
-                                                                          self.xmax,
-                                                                          self.ymin,
-                                                                          self.ymax)
 
 def _interval_overlap(interval_a, interval_b):
         """
@@ -335,6 +350,7 @@ def calculate_IOU(bbox1, bbox2):
     """
     This function is agnostic of where the center is located! 
     """
+    # print('bbox1: {}\nbbox2: {}'.format(bbox1, bbox2))
     w1, h1 = bbox1
     w2, h2 = bbox2
     intersect_w = _interval_overlap([0, w1], [0, w2])
@@ -349,53 +365,6 @@ def calculate_IOU(bbox1, bbox2):
         return 0
 
     return float(intersection)/union
-
-def IOU(bbox1, bbox2):
-    """
-    Calculates Intersection over Union of 2 Bounding boxes
-    """
-    intersect_w = _interval_overlap([bbox1.xmin, bbox1.xmax], [bbox2.xmin, bbox2.xmax])
-    intersect_h = _interval_overlap([bbox1.ymin, bbox1.ymax], [bbox2.ymin, bbox2.ymax])
-
-    intersection = intersect_w*intersect_h
-
-    w1, h1 = (bbox1.xmax - bbox1.xmin, bbox1.ymax - bbox1.ymin)
-    w2, h2 = (bbox2.xmax - bbox2.xmin, bbox2.ymax - bbox2.ymin)
-
-    union = w1*h1 + w2*h2 - intersection # -intersection because otherwise we're counting it twice
-    # print('Int: {} and Union: {}'.format(intersection, union))
-
-    if union < 1e-10: # Avoid division by zero
-        return 0
-
-    return float(intersection)/union
-
-class BestAnchorBoxFinder(object):
-    """
-    Finds the best anchor box for a particular object. This is done by finding the anchor box 
-    with the highest IOU(Intersection over Union) with the bounding box of the object.
-    """
-    def __init__(self, anchors):
-        """
-        Argument:
-        --------
-        anchors: [list] list containing dimensions for each bbox. Example:
-            anchors = [[1, 3], [2, 5], [3, 4]] --> 3 bboxes with width and height:  (1, 3)
-                                                                                    (2, 5)
-                                                                                    (3, 4)
-        """
-        self.anchors = [BBox(0, width, 0, height) for width, height in anchors]
-
-    def find(self, center_w, center_h):
-        """
-        Find the anchor box that best predicts this bbox
-        """
-        target = BBox(0, center_w, 0, center_h)
-        ious = np.frompyfunc(IOU, 2, 1)(self.anchors, target)
-
-        index = np.argmax(ious)
-
-        return index, ious[index]
 
 class WeightsReader(object):
     def __init__(self, weights_file):
