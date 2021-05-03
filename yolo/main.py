@@ -3,22 +3,22 @@ import tensorflow as tf
 import yaml
 from pathlib import Path
 from matplotlib import pyplot as plt
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, CSVLogger
 from tensorflow.keras.optimizers import SGD, Adam, RMSprop
 
-from utils import parse_annotations, ImageReader, normalize, load_config
-from utils import tf_non_max_suppression, non_max_suppression
-from yolo import YOLO_v2, BatchGenerator, yolo_loss, adjust_yolo_output
-from graphic_tools import plot_image
+from yolo.utils import parse_annotations, ImageReader, normalize, load_config
+from yolo.utils import tf_non_max_suppression, non_max_suppression
+from yolo.core import YOLO_v2, BatchGenerator, yolo_loss, adjust_yolo_output
+from yolo.graphic_tools import plot_image
 
 
 def main():
-    root_dir = Path(__file__).resolve().parent.parent
+    root_dir = Path(__file__).resolve().parent
     img_dir = root_dir.joinpath('data/VOCdevkit/VOC2012/JPEGImages')
     ann_dir = root_dir.joinpath('data/VOCdevkit/VOC2012/Annotations')
     
     # Extract hyperparameters
-    config = load_config(root_dir.joinpath('scripts/config.yaml'))
+    config = load_config(root_dir.joinpath('config.yaml'))
 
     all_imgs, seen_labels = parse_annotations(ann_dir, img_dir, labels=config['labels'])
 
@@ -36,6 +36,7 @@ def main():
     #     plot_image(x_batch[i], y_batch[i], config['anchors'], config['labels'], True)
     #     plt.tight_layout()
     #     plt.show()
+
     logs_dir = root_dir.joinpath('logs')     
     if not logs_dir.is_dir():
         print("Creating log dir..")
@@ -50,6 +51,10 @@ def main():
     model.build((None, model.img_shape[1], model.img_shape[0], 3))
     model.summary()
 
+    if root_dir.joinpath('yolov2.weights').exists():
+        print('Loading pre-trained weights..')
+        model.load_weights_from_file(root_dir.joinpath('yolov2.weights'))
+
     early_stop = EarlyStopping(monitor='loss', min_delta=0.001, patience=3, mode='min', 
                                 verbose=1)
     
@@ -57,10 +62,12 @@ def main():
                                 monitor='loss', save_best_only=True, mode='min', 
                                 save_freq=1, verbose=1)
 
+    csv_logger = CSVLogger(str(logs_dir.joinpath('log.csv')), append=True, separator=';')
+
     optimizer = Adam(lr=0.5e-4, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
+
     model.compile(loss=yolo_loss(lambda_coord=5, lambda_noobj=0.5), optimizer=optimizer)
-    print("Model compiled successfully")
-    # print(train_batch_generator)
+    print("Model compiled successfully!")
 
     tf.config.experimental_run_functions_eagerly(True)
 
@@ -68,7 +75,7 @@ def main():
                 steps_per_epoch  = len(train_batch_generator), 
                 epochs           = 50, 
                 verbose          = 1,
-                callbacks        = [early_stop, checkpoint], 
+                callbacks        = [early_stop, checkpoint, csv_logger], 
                 max_queue_size   = 3)
 
     # nb_grids = 4 # Grids containing bboxes

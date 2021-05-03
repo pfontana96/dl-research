@@ -10,7 +10,7 @@ from tensorflow.keras.backend import get_value, set_value
 
 from pathlib import Path
 
-from utils import ImageReader, WeightsReader, read_bytes, calculate_IOU
+from .utils import ImageReader, WeightsReader, read_bytes, calculate_IOU
 
 def adjust_yolo_output(y_pred):
     """
@@ -146,7 +146,6 @@ class YOLO_v2(Model):
 
         self.nb_anchors = len(config['anchors'])
         self.nb_classes = len(config['labels'])
-        # self.true_box_buffer = config['true_box_buffer']
 
         self.img_shape = config['image_shape']
         self.grid = config['grid']
@@ -278,7 +277,6 @@ class BatchGenerator(Sequence):
         
         self.images = images
 
-        # self.true_box_buffer = config['true_box_buffer'] # Maximun objects per box!!
         self.batch_size = config['batch_size']
         self.anchors = config['anchors']
         self.nb_anchors = len(config['anchors'])
@@ -321,22 +319,6 @@ class BatchGenerator(Sequence):
 
             y_batch[iframe,igrid_h,igrid_w,ianchor,5 + iclass] contains 1 if the iclass^th 
             class object exists in this (grid cell, anchor) pair, else it contains 0.
-
-
-        b_batch: [np.array] Array of shape (BATCH_SIZE, 1, 1, 1, TRUE_BOX_BUFFER, 4).
-
-            b_batch[iframe,1,1,1,ibuffer,ianchor,:] contains ibufferth object's 
-            (center_x,center_y,center_w,center_h) in iframeth frame.
-
-            If ibuffer > N objects in iframeth frame, then the values are simply 0.
-
-            TRUE_BOX_BUFFER has to be some large number, so that the frame with the 
-            biggest number of objects can also record all objects.
-
-            The order of the objects do not matter.
-
-            This is just a hack to easily calculate loss. 
-        
         '''
         l_bound = idx*self.batch_size
         r_bound = (idx+1)*self.batch_size
@@ -351,7 +333,6 @@ class BatchGenerator(Sequence):
         x_batch = np.zeros((r_bound - l_bound, self.img_h, self.img_w, 3)) # Input images
         y_batch = np.zeros((r_bound - l_bound, self.grid[1], self.grid[0],
                             self.nb_anchors, 5+len(self.labels)))
-        # b_batch = np.zeros((r_bound - l_bound, 1, 1, 1, self.true_box_buffer, 4))
           
         grid_width = float(self.img_w)/self.grid[0] 
         grid_height = float(self.img_h)/self.grid[1]
@@ -401,10 +382,6 @@ class BatchGenerator(Sequence):
                         # Class' probability for detected object
                         y_batch[instance_count, grid_y, grid_x, best_anchor_id, 5+obj_idx] = 1
 
-                        # Assign the true bbox to b_batch
-                        # b_batch[instance_count, 0, 0, 0, true_box_index] = bbox
-                        # true_box_index = (true_box_index + 1) % self.true_box_buffer
-
                 else:
                     print("Omitting image {} because of inconsistent labeling..".format(train_instance['filename']))
 
@@ -420,40 +397,3 @@ class BatchGenerator(Sequence):
     def on_epoch_end(self):
         if self.shuffle:
             np.random.shuffle(self.images)        
-
-def main():
-    # model.load_weights_from_file(p.joinpath('yolov2.weights'))
-
-    import yaml
-    from pathlib import Path
-    from matplotlib import pyplot as plt
-
-    from utils import parse_annotations, normalize, load_config
-    from graphic_tools import plot_image
-
-    root_dir = Path(__file__).resolve().parent.parent
-    img_dir = root_dir.joinpath('data/VOCdevkit/VOC2012/JPEGImages')
-    ann_dir = root_dir.joinpath('data/VOCdevkit/VOC2012/Annotations')
-
-    config = load_config(root_dir.joinpath('scripts/config.yaml'))
-
-    all_imgs, _ = parse_annotations(ann_dir, img_dir, labels=config['labels'])
-    print("First 3 images:\n{}\n{}\n{}".format(all_imgs[0], all_imgs[1], all_imgs[2]))
-    print(".."*40)
-
-    train_batch_generator = BatchGenerator(all_imgs, config, norm=normalize, shuffle=True)
-    x_batch, y_batch = train_batch_generator.__getitem__(idx=3)
-    print("x_batch: (BATCH_SIZE, IMAGE_H, IMAGE_W, N channels)           = {}".format(x_batch.shape))
-    print("y_batch: (BATCH_SIZE, GRID_H, GRID_W, BOX, 4 + 1 + N classes) = {}".format(y_batch.shape))
-
-    print(".."*40)
-    for i in range(5):
-        print('Image {}:'.format(i))
-        grid_y, grid_x, anchor_id = np.where(y_batch[i,:,:,:,4]==1) # BBoxes with 100% confidence
-        
-        plot_image(x_batch[i], y_batch[i], config['anchors'],config['labels'])
-        plt.tight_layout()
-        plt.show()
-
-if __name__ == '__main__':
-    main()

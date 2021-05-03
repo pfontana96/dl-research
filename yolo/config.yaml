@@ -30,6 +30,4 @@ image_shape: [416, 416] # Image size!
 
 grid: [13, 13] # Number of gridcells
 
-batch_size: 16
-
-true_box_buffer: 50
+batch_size: 2
