@@ -7,108 +7,9 @@ from copy import deepcopy
 import numpy as np
 import tensorflow as tf
 
-def non_max_suppression(y_batch, iou_threshold, prob_threshold):
-    count = 0
-    new_y_batch = np.zeros(y_batch.shape)
-    _, grid_y, grid_x, nb_anchors, nb_classes = y_batch.shape 
-    nb_classes -= 5 # (x, y, w, h)
-    nb_bboxes = grid_y*grid_x*nb_anchors
-
-    iou_vfunc = np.frompyfunc(lambda x1, x2, x3, x4: calculate_IOU(
-                            np.array([x1, x2]), np.array([x3, x4])), 
-                            4, 1)
-    for instance in y_batch:
-        # For each instance we'll need to calculate the scores for each bounding box predicted
-        # As we're predicting Pc and C1, C2, ..., Cn as the scores will be calculated as follow
-        # score = Pc*Ci = P(Classi|Object)*P(Object)
-        scores = tf.multiply(tf.reshape(instance[:,:,:,5:], (-1, nb_classes)),
-                            tf.reshape(instance[:,:,:,4], (-1,1))).numpy()
-        
-        scores = np.where(scores == np.max(scores, axis=1, keepdims=True), scores, 0)
-
-        bboxes = tf.reshape(instance[:,:,:,2:4], (-1, 2)).numpy()
-
-        for class_id in range(nb_classes):
-            # mask = self.instance_non_max_suppression(bboxes, scores[:, class_id])
-            ids = np.array(range(nb_bboxes))
-            mask = np.zeros((nb_bboxes), dtype=bool)
-            c_scores = scores[:, class_id]
-            c_bboxes = bboxes
-
-            # Eliminate low confidence predictions
-            index = np.where(c_scores >= prob_threshold)[0]
-            ids = ids[index]
-            c_bboxes = c_bboxes[index]
-            c_scores = c_scores[index]
-
-            while len(ids):
-                best_index = np.argmax(c_scores)
-                best_id = ids[best_index]
-                best_bbox = c_bboxes[best_index]
-
-                # Mark current bbox in mask
-                mask[best_id] = True
-
-                ids = np.delete(ids, best_index)
-                c_bboxes = np.delete(c_bboxes, best_index, axis=0)
-
-                if not len(ids):
-                    break
-                    
-                ious = iou_vfunc(best_bbox[0], best_bbox[1], c_bboxes[:,0], c_bboxes[:,1])
-                remove_index = np.where(ious >= iou_threshold)[0]
-
-                ids = np.delete(ids, remove_index)
-                c_bboxes = np.delete(c_bboxes, remove_index, axis=0)
-                c_scores = np.delete(c_scores, np.concatenate((remove_index, [best_index])))
-
-            mask = mask.reshape(grid_y, grid_x, nb_anchors)
-
-            new_y_batch[count, mask] = instance[mask]
-
-        count += 1
-
-    return tf.constant(new_y_batch)    
-
-def tf_non_max_suppression(y_batch, iou_threshold, prob_threshold):
-    count = 0
-    batch_size, grid_y, grid_x, nb_anchors, nb_classes = y_batch.shape
-    nb_classes -= 5 # (x, y, w, h, pr)
-    new_y_batch = np.zeros(y_batch.shape, dtype=float)
-    # nms_vfunc = np.frompyfunc(lambda scrs: self.instance_non_max_suppression(bboxes, scrs), 
-    #                           self.grid[0]*self.grid[1]*self.nb_anchors, 1)
-    nb_bboxes = grid_y*grid_x*nb_anchors
-    dummy_center = tf.zeros((nb_bboxes, 2), dtype=tf.float32)
-    for instance in y_batch:
-        # For each instance we'll need to calculate the scores for each bounding box predicted
-        # As we're predicting Pc and C1, C2, ..., Cn as the scores will be calculated as follow
-        # score = Pc*Ci = P(Classi|Object)*P(Object)
-        scores = tf.multiply(tf.reshape(instance[:,:,:,5:], (-1, nb_classes)),
-                            tf.reshape(instance[:,:,:,4], (-1,1)))
-        
-        scores = tf.cast(tf.where(scores == tf.reduce_max(scores, axis=1, keepdims=True), scores, 0),
-                        tf.float32)
-    
-        bboxes = tf.cast(tf.reshape(instance[:,:,:,2:4], (-1, 2)), tf.float32)
-        bboxes = tf.concat([dummy_center, bboxes], axis=1)
-
-
-        for class_id in range(nb_classes):
-            mask = np.zeros(nb_bboxes, dtype=bool)
-            index = tf.image.non_max_suppression(bboxes, scores[:, class_id], 30,
-                    iou_threshold=iou_threshold, score_threshold=prob_threshold) # 30 max objects detected per image
-            mask[index.numpy()] = True
-            mask = mask.reshape(grid_x, grid_y, nb_anchors)
-
-            new_y_batch[count, mask] = instance[mask]
-
-        count += 1
-
-    return tf.constant(new_y_batch)  
-
-def read_bytes(weights, offset, size):
-    offset += size
-    return (weights[offset-size:offset], offset)
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#                                   COMMON UTILS
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  
 
 def load_config(filename):
     """
@@ -125,6 +26,10 @@ def load_config(filename):
     assert(isinstance(filename, Path)), "Argument is not a pathlib.Path"
     assert(filename.suffix==".yaml"), "File extension is not .yaml"
 
+    if not all (k in foo for foo in ("image_shape", "batch_size", "anchors", "labels")):
+        raise ValueError("Critical element missing in config file.\n'anchors'       \
+                          'batch_size' 'image_shape' and 'labels' must be defined")
+
     with open(filename, 'r') as fd:
         config = yaml.load(fd, Loader=yaml.FullLoader)
     
@@ -132,8 +37,22 @@ def load_config(filename):
         # Convert list to np arrays
         if type(value)==list:
             config[key] = np.array(value)
+    
+    # YOLO v2 reduction factor is 32
+    if np.sum(config['image_shape']%32, axis=0):
+        raise ValueError("Invalid image shape. Only multiples of 32 are accepted as YOLO's \
+                          reduction factor is 32).")
+        
+    config['grid'] = np.array((config['image_shape']/32).astype(int))
+
+    if config['anchors'].shape[1] != 4:
+        raise ValueError("Invalid anchors shape. Shape should be (nb_anchors, 4).")
 
     return config
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#                                   IMAGES OPERATIONS
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 def parse_annotations(ann_dir, img_dir, labels=[]):
     """
@@ -327,6 +246,138 @@ class ImageReader(object):
 
         return (center_x, center_y, center_w, center_h)
 
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#                                   IOU AND NON MAX CALCULATIONS
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+def non_max_suppression(y_batch, iou_threshold, prob_threshold):
+    count = 0
+    new_y_batch = np.zeros(y_batch.shape)
+    _, grid_y, grid_x, nb_anchors, nb_classes = y_batch.shape 
+    nb_classes -= 5 # (x, y, w, h)
+    nb_bboxes = grid_y*grid_x*nb_anchors
+
+    iou_vfunc = np.frompyfunc(lambda x1, x2, x3, x4: calculate_IOU(
+                            np.array([x1, x2]), np.array([x3, x4])), 
+                            4, 1)
+    for instance in y_batch:
+        # For each instance we'll need to calculate the scores for each bounding box predicted
+        # As we're predicting Pc and C1, C2, ..., Cn as the scores will be calculated as follow
+        # score = Pc*Ci = P(Classi|Object)*P(Object)
+        scores = tf.multiply(tf.reshape(instance[:,:,:,5:], (-1, nb_classes)),
+                            tf.reshape(instance[:,:,:,4], (-1,1))).numpy()
+        
+        scores = np.where(scores == np.max(scores, axis=1, keepdims=True), scores, 0)
+
+        bboxes = tf.reshape(instance[:,:,:,2:4], (-1, 2)).numpy()
+
+        for class_id in range(nb_classes):
+            # mask = self.instance_non_max_suppression(bboxes, scores[:, class_id])
+            ids = np.array(range(nb_bboxes))
+            mask = np.zeros((nb_bboxes), dtype=bool)
+            c_scores = scores[:, class_id]
+            c_bboxes = bboxes
+
+            # Eliminate low confidence predictions
+            index = np.where(c_scores >= prob_threshold)[0]
+            ids = ids[index]
+            c_bboxes = c_bboxes[index]
+            c_scores = c_scores[index]
+
+            while len(ids):
+                best_index = np.argmax(c_scores)
+                best_id = ids[best_index]
+                best_bbox = c_bboxes[best_index]
+
+                # Mark current bbox in mask
+                mask[best_id] = True
+
+                ids = np.delete(ids, best_index)
+                c_bboxes = np.delete(c_bboxes, best_index, axis=0)
+
+                if not len(ids):
+                    break
+                    
+                ious = iou_vfunc(best_bbox[0], best_bbox[1], c_bboxes[:,0], c_bboxes[:,1])
+                remove_index = np.where(ious >= iou_threshold)[0]
+
+                ids = np.delete(ids, remove_index)
+                c_bboxes = np.delete(c_bboxes, remove_index, axis=0)
+                c_scores = np.delete(c_scores, np.concatenate((remove_index, [best_index])))
+
+            mask = mask.reshape(grid_y, grid_x, nb_anchors)
+
+            new_y_batch[count, mask] = instance[mask]
+
+        count += 1
+
+    return tf.constant(new_y_batch)    
+
+def tf_non_max_suppression(y_batch, iou_threshold, prob_threshold):
+    count = 0
+    batch_size, grid_y, grid_x, nb_anchors, nb_classes = y_batch.shape
+    nb_classes -= 5 # (x, y, w, h, pr)
+    new_y_batch = np.zeros(y_batch.shape, dtype=float)
+    # nms_vfunc = np.frompyfunc(lambda scrs: self.instance_non_max_suppression(bboxes, scrs), 
+    #                           self.grid[0]*self.grid[1]*self.nb_anchors, 1)
+    nb_bboxes = grid_y*grid_x*nb_anchors
+    dummy_center = tf.zeros((nb_bboxes, 2), dtype=tf.float32)
+    for instance in y_batch:
+        # For each instance we'll need to calculate the scores for each bounding box predicted
+        # As we're predicting Pc and C1, C2, ..., Cn as the scores will be calculated as follow
+        # score = Pc*Ci = P(Classi|Object)*P(Object)
+        scores = tf.multiply(tf.reshape(instance[:,:,:,5:], (-1, nb_classes)),
+                            tf.reshape(instance[:,:,:,4], (-1,1)))
+        
+        scores = tf.cast(tf.where(scores == tf.reduce_max(scores, axis=1, keepdims=True), scores, 0),
+                        tf.float32)
+    
+        bboxes = tf.cast(tf.reshape(instance[:,:,:,2:4], (-1, 2)), tf.float32)
+        bboxes = tf.concat([dummy_center, bboxes], axis=1)
+
+
+        for class_id in range(nb_classes):
+            mask = np.zeros(nb_bboxes, dtype=bool)
+            index = tf.image.non_max_suppression(bboxes, scores[:, class_id], 30,
+                    iou_threshold=iou_threshold, score_threshold=prob_threshold) # 30 max objects detected per image
+            mask[index.numpy()] = True
+            mask = mask.reshape(grid_x, grid_y, nb_anchors)
+
+            new_y_batch[count, mask] = instance[mask]
+
+        count += 1
+
+    return tf.constant(new_y_batch)
+
+def calculate_IOU_nag(bbox1, bbox2):
+    """
+    Non agnostic calculation of IOU (depends on the position xy)
+
+    Arguments:
+    ---------
+    bbox1: [tf.tensor] 2D Array containing (x, y, w, h) with shape (nb_bboxes, 4)
+    bbox2: [tf.tensor] 2D Array containing (x, y, w, h) with shape (nb_bboxes, 4)
+    """
+    bbox1_wh_half = bbox1[:,2:4]/2
+    bbox1_min = bbox1[:, 0:2] - bbox1_wh_half
+    bbox1_min = bbox1[:, 0:2] + bbox1_wh_half
+
+    bbox2_wh_half = bbox2[:,2:4]/2
+    bbox2_min = bbox2[:, 0:2] - bbox2_wh_half
+    bbox2_min = bbox2[:, 0:2] + bbox2_wh_half
+
+    intersect_mins = tf.maximum(bbox1_min, bbox2_min, axis=1)
+    intersect_maxs = tf.maximum(bbox1_max, bbox2_max, axis=1)
+    intersect_wh = tf.maximum(intersect_maxs - intersect_mins, 0, axis=1)
+    intersect = intersect_wh[0] * intersect_wh[1]
+
+    bbox1_areas = bbox1[:, 2] * bbox1[:, 3]
+    bbox2_areas = bbox2[:, 2] * bbox2[:, 3]
+
+    union = bbox1_areas + bbox2_areas - intersect
+
+    return tf.divide_no_nan(intersect, union)
+
 def _interval_overlap(interval_a, interval_b):
         """
         Helper function for IOU calculation
@@ -349,8 +400,16 @@ def _interval_overlap(interval_a, interval_b):
 def calculate_IOU(bbox1, bbox2):
     """
     This function is agnostic of where the center is located! 
+    
+    Arguments:
+    ---------
+    bbox1: [np.array] or [list] Array containing (w,h) for bbox 1
+    bbox2: [np.array] or [list] Array containing (w,h) for bbox 2
+
+    Return:
+    ------
+    iou: [float] Resulting IOU
     """
-    # print('bbox1: {}\nbbox2: {}'.format(bbox1, bbox2))
     w1, h1 = bbox1
     w2, h2 = bbox2
     intersect_w = _interval_overlap([0, w1], [0, w2])
@@ -359,12 +418,19 @@ def calculate_IOU(bbox1, bbox2):
     intersection = intersect_w*intersect_h
 
     union = w1*h1 + w2*h2 - intersection # -intersection because otherwise we're counting it twice
-    # print('Int: {} and Union: {}'.format(intersection, union))
 
     if union < 1e-10: # Avoid division by zero
         return 0
 
     return float(intersection)/union
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#                                   LOAD WEIGHTS
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+def read_bytes(weights, offset, size):
+    offset += size
+    return (weights[offset-size:offset], offset)
 
 class WeightsReader(object):
     def __init__(self, weights_file):

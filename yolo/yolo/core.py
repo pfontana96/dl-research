@@ -10,7 +10,7 @@ from tensorflow.keras.backend import get_value, set_value
 
 from pathlib import Path
 
-from .utils import ImageReader, WeightsReader, read_bytes, calculate_IOU
+from .utils import ImageReader, WeightsReader, read_bytes, calculate_IOU, calculate_IOU_nag
 
 def adjust_yolo_output(y_pred):
     """
@@ -47,49 +47,67 @@ def yolo_loss(lambda_coord, lambda_noobj):
         y_pred : [tf.Tensor] Tensor of shape (batch_size, grid_h, grid_w, nb_anchors, 5+nb_classes)
                 containing ground truth values
         """
-        # Convert network's output
+        # Convert network's output (see adjust_yolo_ouput for further info)
         y_pred = adjust_yolo_output(y_pred)
 
         # Get common values
         batch_size, grid_h, grid_w, nb_anchors, _ = y_true.shape
+        nb_bboxes = batch_size*grid_h*grid_w*nb_anchors
+        epsilon = 1e-6 # Epsilon to avoid division by 0
 
         # Get mask for indexing where there're objects detected on ground truth
         gt_obj_mask = tf.where(y_true[:,:,:,:,4] == 1, True, False).numpy()
 
+        # ------------------------------------------------------------------------
         # Localizaton LOSS (i.e. differences in true bboxes and the predicted ones)
+
         # Calculate x,y loss
         pred_xy = y_pred[gt_obj_mask][:,0:2]
         true_xy = y_true[gt_obj_mask][:,0:2]
 
         loss_xy = tf.reduce_sum(tf.reduce_sum(tf.math.square(pred_xy - true_xy), 0), 0)
+        loss_xy = loss_xy / (nb_bboxes + epsilon)
 
         # Calculate w,h loss
         pred_wh = y_pred[gt_obj_mask][:,2:4]
         true_wh = y_true[gt_obj_mask][:,2:4]
+
         # As defined in original paper's loss, we take de square roots
         pred_wh = tf.math.sqrt(pred_wh)
         true_wh = tf.math.sqrt(true_wh)
 
         loss_wh = tf.reduce_sum(tf.reduce_sum(tf.math.square(pred_wh - true_wh), 0), 0)
+        loss_wh = loss_wh / (nb_bboxes + epsilon)
 
+        # ------------------------------------------------------------------------
         # Confidence LOSS (i.e. differences between anchor confidence vs ground truth(1) )
+
         pred_c_obj = y_pred[gt_obj_mask][:,4]
         true_c_obj = y_true[gt_obj_mask][:,4]   #TODO: Shouldn't this be always 1 for ground truth?
         
         loss_c = tf.reduce_sum(tf.math.square(pred_c_obj - true_c_obj), 0)
+        
         # We also account for images with no objects in them
         pred_c_noobj = y_pred[~gt_obj_mask][:,4]
         true_c_noobj = y_true[~gt_obj_mask][:,4]
 
         loss_c += lambda_noobj*tf.reduce_sum(tf.math.square(pred_c_obj - true_c_obj), 0)
 
-        # Classification LOSS (i.e. class probabilities discrepancies)
-        pred_class = y_pred[gt_obj_mask][:,5:]
-        true_class = y_true[gt_obj_mask][:,5:] #TODO: Shouldn't this be always 1 for ground truth?
-        loss_p = tf.reduce_sum(tf.reduce_sum(tf.math.square(pred_class - true_class), 0), 0)
+        loss_c = loss_c/(nb_bboxes + epsilon)
 
-        # Return total loss
-        return lambda_coord*(loss_xy + loss_wh) + loss_c + loss_p
+        # ------------------------------------------------------------------------
+        #           Classification LOSS (i.e. class probabilities discrepancies)
+
+        # We use cross_entropy
+        pred_class = y_pred[gt_obj_mask][:,5:]
+        true_class = tf.argmax(y_true[gt_obj_mask][:,5:], -1) # Index for cross-entropy calculation
+        loss_class = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=true_class, logits=pred_class)
+        loss_class = tf.reduce_sum(loss_class) / (nb_bboxes + epsilon)
+
+        # ------------------------------------------------------------------------
+        #                               Total LOSS
+
+        return lambda_coord*(loss_xy + loss_wh) + loss_c + loss_class
     return calculate_loss
 
 class LearningRateScheduler(Callback):
@@ -150,7 +168,7 @@ class YOLO_v2(Model):
         self.img_shape = config['image_shape']
         self.grid = config['grid']
 
-        # Specifications taken of original paper (based on Darknet-19)
+        # Specifications taken from original paper (based on Darknet-19)
         filters = [32, 64, 128, 64, 128, 256, 128, 256, 512, 256, 512, 256, 512, 
                    1024, 512, 1024, 512, 1024, 1024, 1024, 64, 1024, self.nb_anchors*(5 + self.nb_classes)]
         kernels = [(3,3), (3,3), (3,3), (1,1), (3,3), (3,3), (1,1), (3,3), (3,3), (1,1), (3,3),
@@ -388,7 +406,6 @@ class BatchGenerator(Sequence):
             x_batch[instance_count] = img
             instance_count += 1
 
-        # return [x_batch, b_batch], y_batch
         return x_batch, y_batch
 
     def __len__(self):

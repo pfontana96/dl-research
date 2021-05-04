@@ -58,9 +58,9 @@ def main():
     early_stop = EarlyStopping(monitor='loss', min_delta=0.001, patience=3, mode='min', 
                                 verbose=1)
     
-    checkpoint = ModelCheckpoint(str(check_dir.joinpath('yolo_v2_weights_voc_2012')), 
+    checkpoint = ModelCheckpoint(str(check_dir.joinpath('yolo_v2_weights_voc_2012.h5')), 
                                 monitor='loss', save_best_only=True, mode='min', 
-                                save_freq=1, verbose=1)
+                                save_freq=5*config['batch_size'], verbose=1)
 
     csv_logger = CSVLogger(str(logs_dir.joinpath('log.csv')), append=True, separator=';')
 
