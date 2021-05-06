@@ -1,3 +1,25 @@
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#                               YOLO v2 CONFIG FILE
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Mandatory parameters:
+# -------------------- 
+#   labels:       [list] List of classes to be detected.
+#   anchors:      [array] Array of shape (nb_anchors, 2) specifying 
+#                         (w, h) for each anchor box to be used.
+#   image_shape:  [array] Array of shape (1,2) specifying desired 
+#                         input image's width and height.
+# Optional parameters:
+# -------------------
+#   epochs:       [int] Number of epochs if training.
+#   optimizer:    [str] Optimizer to use. Must be one of ('adam', 'sgd',
+#                       'rmsprop')
+#   log_path:     [str] Path to log dir. If specified, a .csv will be created
+#                       containing metrics info on training
+#   weights_path: [str] Path to weights file (.h5). If specified, weights 
+#                       will be loaded from file
+#   output_path:  [str] Path to dir where outputs will be generated (.xml)
+#                       If not specified, execution dir will be taked
+
 labels:
   - aeroplane
   - bicycle
@@ -26,7 +48,6 @@ anchors:
   - [10.47181473, 10.09646365] # Anchor box 3 (width and height)
   - [5.48531347,  8.11011331]  # Anchor box 4 (width and height)
 
-# image_shape: [416, 416] # Image size!
 image_shape: [256, 256] # Image size!
 
 batch_size: 16
@@ -34,3 +55,14 @@ batch_size: 16
 epochs: 50
 
 optimizer: adam
+
+schedule:
+  - [0, 0.001]
+  - [20, 0.0001]
+  - [35, 0.00001]
+
+# log_path: path_to_log_dir
+
+# weights_path: path_to_h5_file
+
+# output_path: path_to_output

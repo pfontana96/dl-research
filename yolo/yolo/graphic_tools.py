@@ -14,19 +14,6 @@ def plot_image(x_batch_instace, y_batch_instance, anchors, labels, plot_grid=Fal
 
     plot_bbox(y_batch_instance, (img_h, img_w), anchors, labels, confidence_threshold)
 
-# def plot_image(x_batch_instace, y_batch_instance, labels, plot_grid=False, confidence_threshold=1):
-    
-#     grid_h, grid_w, _, _ = y_batch_instance.shape
-#     img_h, img_w, _ = x_batch_instace.shape
-
-#     if plot_grid:
-#         plot_img_with_gridcell(x_batch_instace, (grid_w, grid_h))
-#     else:
-#         plt.figure(figsize=(15,15))
-#         plt.imshow(x_batch_instace)
-
-#     plot_bbox(y_batch_instance, (img_h, img_w), labels, confidence_threshold)
-
 def plot_img_with_gridcell(img, grids, color="yellow"):
     """
 
@@ -70,8 +57,6 @@ def plot_bbox(output_instance, img_shape, anchors, labels, confidence_threshold=
 
     anchor_width = anchors[anchor_id, 0]
     anchor_height = anchors[anchor_id, 1]
-    # print('anchor_w: {:.3f} and anchor_height {:.3f}'.format(anchor_width, anchor_height))
-
 
     bbox_ids, labels_ids = np.where(confident_outputs[:, 5:])
     names = labels[labels_ids]
@@ -105,47 +90,34 @@ def plot_bbox(output_instance, img_shape, anchors, labels, confidence_threshold=
                     np.array([ymax,ymax]),color=c,linewidth=5)
         id_obj += 1
 
-# def plot_bbox(output_instance, img_shape, labels, confidence_threshold=1):
-#     color_palette = list(sns.xkcd_rgb.values())
+def plot_bbox_abs(bboxes, scores, class_ids, labels, score_threshold=0.01):
+    color_palette = list(sns.xkcd_rgb.values())
 
-#     grid_y, grid_x, anchor_id = np.where(output_instance[:,:,:,4] >= confidence_threshold)
+    confident_index = np.where(scores >= score_threshold)
+    confident_bboxes = bboxes[confident_index]
+    class_ids = class_ids[confident_index]
+    scores = scores[confident_index]
+    
+    for i in range(len(scores)):
+        x, y, w, h = confident_bboxes[i]
+        clss_id = class_ids[i]
+        label = labels[clss_id]
+        c = color_palette[clss_id]
+        score = scores[i]
 
-#     confident_outputs = output_instance[grid_y, grid_x, anchor_id] # Boxes with confidence 1
-#     predicted_bboxes = confident_outputs[:, 0:4] # x, y, w, h
-#     scores = confident_outputs[:, 4]
+        xmin = x - 0.5*w
+        xmax = x + 0.5*w
+        ymin = y - 0.5*h
+        ymax = y + 0.5*h
 
-#     nb_grids_y, nb_grids_x, _, _ = output_instance.shape
-#     grid_width = img_shape[0]/nb_grids_x
-#     grid_height = img_shape[1]/nb_grids_y
-
-#     bbox_ids, labels_ids = np.where(confident_outputs[:, 5:])
-#     names = labels[labels_ids]
-
-#     id_obj = 0
-#     for bbox in predicted_bboxes:
-#         x, y, w, h = bbox
-
-#         x = (x + grid_x[id_obj])*grid_width 
-#         y = (y + grid_y[id_obj])*grid_height
-#         w = w*grid_width
-#         h = h*grid_height
-
-#         c = color_palette[id_obj]
-        
-#         xmin = x - 0.5*w
-#         xmax = x + 0.5*w
-#         ymin = y - 0.5*h
-#         ymax = y + 0.5*h
-
-#         plt.text(x, y, "X",color=c,fontsize=15)
-#         plt.text(xmin, ymin, "{} ({:.2f})".format(names[id_obj], scores[id_obj]), 
-#                     color ='black', fontsize=7, backgroundcolor=c)
-#         plt.plot(np.array([xmin,xmin]),
-#                     np.array([ymin,ymax]),color=c,linewidth=5)
-#         plt.plot(np.array([xmin,xmax]),
-#                     np.array([ymin,ymin]),color=c,linewidth=5)
-#         plt.plot(np.array([xmax,xmax]),
-#                     np.array([ymax,ymin]),color=c,linewidth=5)  
-#         plt.plot(np.array([xmin,xmax]),
-#                     np.array([ymax,ymax]),color=c,linewidth=5)
-#         id_obj += 1
+        plt.text(x, y, "X",color=c,fontsize=15)
+        plt.text(xmin, ymin, "{} ({:.2f})".format(label, score), 
+                    color ='black', fontsize=7, backgroundcolor=c)
+        plt.plot(np.array([xmin,xmin]),
+                    np.array([ymin,ymax]),color=c,linewidth=5)
+        plt.plot(np.array([xmin,xmax]),
+                    np.array([ymin,ymin]),color=c,linewidth=5)
+        plt.plot(np.array([xmax,xmax]),
+                    np.array([ymax,ymin]),color=c,linewidth=5)  
+        plt.plot(np.array([xmin,xmax]),
+                    np.array([ymax,ymax]),color=c,linewidth=5)

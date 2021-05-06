@@ -23,14 +23,16 @@ def adjust_yolo_output(y_pred):
         bw = pw*exp(tw)
         bh = ph*exp(th)
         Pr(obj)*IOU(b,obj) = sigmoid(to)
+        Pr(Ci) = softmax([C1 C2 .. Cn])
     """
     batch_size, grid_y, grid_x, nb_anchors, output_dim = y_pred.shape
     y_pred = tf.reshape(y_pred, (-1, output_dim))
     pred_xy = tf.sigmoid(y_pred[:, 0:2])
     pred_wh = tf.exp(y_pred[:, 2:4])
     pred_p = tf.reshape(tf.sigmoid(y_pred[:, 4]), (-1,1))
+    pred_classes = tf.nn.softmax(y_pred[:, 5:])
 
-    output = tf.concat([pred_xy, pred_wh, pred_p, y_pred[:,5:]], axis=1)
+    output = tf.concat([pred_xy, pred_wh, pred_p, pred_classes], axis=1)
     
     return tf.reshape(output, (batch_size, grid_y, grid_x, nb_anchors, output_dim))
 

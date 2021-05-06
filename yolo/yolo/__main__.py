@@ -9,20 +9,16 @@ from .core import YOLO_v2, yolo_loss, LearningRateScheduler, BatchGenerator
 from .utils import load_config, parse_annotations, normalize
 from .graphic_tools import plot_image
 
-parser = argparse.ArgumentParser(prog = "YOLO v2")
-sb_parser_action = parser.add_subparsers()
-sb_parser_action.add_argument("-t", "--train", help="Train model with specified data path.\n\
-                                Path should containg a folder named /JPEGImages (containing\
-                                 *.jpg files) and another named /Annotations (containing *.xml\
-                                  annotations files).", nargs=1)
-sb_parser_action.add_argument("-p", "--predict", help="Predict image (path to .jpg file).", nargs=1)
+parser = argparse.ArgumentParser(prog = "yolo")
+parser.add_argument("action", choices=["train", "predict"], nargs=1, help="action to take. If train\
+                    : [filename] path to directory containing data (Should contain a dir named\
+                    /JPEGImages (*.jpg) and another one named /Annotations (*.xml). If predict: \
+                    [filename] path to whether a directory containing images (*.jpg) or a single\
+                    image file (.jpg)")
 
-parser.add_argument("-c", "--config", help="Path to config file (defaults to config.yaml in \
-                                            current directory).", nargs=1)
-parser.add_argument("-w", "--weights", help="Load weights from file (defaults to weights.h5 in \
-                                             current, random initialization if file does not \
-                                             exist).")
-parser.add_argument("-s", "--show", help="Flag to plot figure")
+parser.add_argument("-c", "--config", help="path to config file (defaults to config.yaml in \
+                                            current directory)", nargs=1)
+parser.add_argument("-s", "--show", help="flag to plot output")
 
 args = parser.parse_args()
 
@@ -35,14 +31,14 @@ def get_model(config, weights_file=None):
         if type(config['learning_rate']) == np.ndarray:
             callbacks.append(LearningRateScheduler(config['learning_rate']))
             # Get first learning rate
-            lr = config['learning_rate'][np.argmin(config['learning_rate'][:,0], 1)        
+            lr = config['learning_rate'][np.argmin(config['learning_rate'][:,0], 1)]        
 
     # Define optimizer
     if not 'optimizer' in config.keys():
         # Default optimizer is adam
         optimizer = Adam(learning_rate=lr, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
     else:
-        if not all (k in foo for foo in ("adam", "sgd", "rmsprop")):
+        if not config['optimizer'] in ("adam", "sgd", "rmsprop"):
             raise ValueError("Not supported optimizer in config file. Currently supported\
                               options:\n'adam' 'sgd' 'rmsprop'")
         
@@ -77,6 +73,9 @@ def get_model(config, weights_file=None):
                   optimizer=optimizer)
 
     return model
+
+def train(model):
+    pass
 
 def main():
     if not args.config:

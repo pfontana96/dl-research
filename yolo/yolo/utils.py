@@ -3,10 +3,64 @@ from pathlib import Path
 import yaml
 import cv2 
 from copy import deepcopy
+from itertools import chain
 
 import numpy as np
 import tensorflow as tf
 
+def extract_bboxes(y_batch, anchors, image_shape, max=False):
+    """
+    Loads a batch of prediction and returns bboxes.
+
+    Arguments:
+    ---------
+    y_batch:     [tf.Tensor] Tensor of shape (batch_size, grid_w, grid_h, nb_anchors, 5+nb_classes)
+    anchors:     [np.array] Array of shape (nb_anchors, 2) specifying anchors used for y_batch (width and height)
+    image_shape: [np.array] [tuple] [list] Input Image shape (width and height)
+    max:         [bool] If max is set to True, only the class with max score will be returned
+
+    Return:
+    ------
+    bboxes:      [List] List of shape (batch_size) containing an np.array of shape [nb_bbox_in_img, nb_classes]
+                  where each bbox is defined by (x, y, w, h, [scores]) where [scores] = [Pc1, ..., Pcn]. 
+                  If max is True, [scores] will consist of [max(Pc), argmax(Pc)] 
+    """
+    _, nb_grids_y, nb_grids_x, nb_anchors, nb_classes = y_batch.shape
+    nb_classes -= 5
+
+    grid_width = image_shape[0]/nb_grids_x
+    grid_height = image_shape[1]/nb_grids_y
+
+    # Indices to use after reshape
+    grid_y_offsets = np.array(list(chain(*([x]*nb_grids_x*nb_anchors for x in range(nb_grids_y)))))
+    grid_x_offsets = np.array(list(chain(*([x]*nb_anchors for x in range(nb_grids_x))))*nb_grids_y)
+    anchor_index = np.array([range(nb_anchors)]*nb_grids_y*nb_grids_x).reshape(-1)
+
+    anchor_w_offsets = anchors[anchor_index, 0]
+    anchor_h_offsets = anchors[anchor_index, 1]
+
+    bboxes = []
+    scores = []
+    for instance in y_batch:
+        scores_tf = tf.expand_dims(instance[:,:,:,4], axis=3)*instance[:,:,:,5:]
+        scores_tf = tf.reshape(scores_tf, (-1, nb_classes))
+        # We need to rescale bboxes from gridcell's position and anchor dimension back to rescaled
+        # image of config['image_shape']
+
+        bboxes_tf = tf.reshape(instance[:,:,:,0:4], (-1, 4))
+        scaled_back_x = tf.reshape((bboxes_tf[:,0]+grid_x_offsets)*grid_width, (-1,1))
+        scaled_back_y = tf.reshape((bboxes_tf[:,1]+grid_y_offsets)*grid_height, (-1,1))
+        scaled_back_w = tf.reshape(bboxes_tf[:,2]*anchor_w_offsets, (-1,1))
+        scaled_back_h = tf.reshape(bboxes_tf[:,3]*anchor_h_offsets, (-1,1))
+
+        bboxes_tf = tf.concat([scaled_back_x, 
+                               scaled_back_y,
+                               scaled_back_w,
+                               scaled_back_h], axis=1)
+        bboxes.append(bboxes_tf.numpy())
+        scores.append(scores_tf.numpy())
+
+    return bboxes, scores
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #                                   COMMON UTILS
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  
@@ -26,13 +80,13 @@ def load_config(filename):
     assert(isinstance(filename, Path)), "Argument is not a pathlib.Path"
     assert(filename.suffix==".yaml"), "File extension is not .yaml"
 
-    if not all (k in foo for foo in ("image_shape", "batch_size", "anchors", "labels")):
-        raise ValueError("Critical element missing in config file.\n'anchors'       \
-                          'batch_size' 'image_shape' and 'labels' must be defined")
-
     with open(filename, 'r') as fd:
         config = yaml.load(fd, Loader=yaml.FullLoader)
     
+    if not set(["image_shape", "batch_size", "anchors", "labels"]).issubset(config.keys()):
+        raise ValueError("Critical element missing in config file.\n'anchors'       \
+                          'batch_size' 'image_shape' and 'labels' must be defined")
+
     for key, value in config.items():
         # Convert list to np arrays
         if type(value)==list:
@@ -45,8 +99,8 @@ def load_config(filename):
         
     config['grid'] = np.array((config['image_shape']/32).astype(int))
 
-    if config['anchors'].shape[1] != 4:
-        raise ValueError("Invalid anchors shape. Shape should be (nb_anchors, 4).")
+    if config['anchors'].shape[1] != 2:
+        raise ValueError("Invalid anchors shape. Shape should be (nb_anchors, 2).")
 
     return config
 
@@ -249,6 +303,63 @@ class ImageReader(object):
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #                                   IOU AND NON MAX CALCULATIONS
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def non_max_suppression_v2(bboxes, scores, class_ids, iou_threshold, score_threshold):
+    """
+    Calculates Non Max suppression in a numpy way
+
+    Arguments:
+    ---------
+    bboxes:          [np.array] Numpy array containing bboxes (x, y, w, h) in absolute 
+                                coordinates
+    scores:          [np.array] Array of scores corresponding to each bbox
+    iou_threshold:   [float] IOU threshold (each bbox with IOU >= IOU threshold will be discarted)
+    score_threshold: [float] Score threshold (each bbox with score < score_threshold will be 
+                             discarted)
+
+    Return:
+    ------
+    result_bboxes:   [np.array] Array of resulting bboxes 
+    result_scores:
+    result_classes:
+    """
+    result_bboxes = []
+    result_scores = []
+    result_classes = []
+
+    # Drop non confident bboxes
+    index = np.where(scores >= score_threshold)
+
+    bboxes = bboxes[index]
+    scores = scores[index]
+    class_ids = class_ids[index]
+
+    for clss in np.unique(class_ids):
+        index = np.where(class_ids == clss)
+        c_scores = scores[index]
+        c_bboxes = bboxes[index]
+        while len(c_scores):
+            curr_best_id = np.argmax(c_scores)
+            curr_best_bbox = c_bboxes[curr_best_id].reshape(-1,4)
+            
+            result_bboxes.append(curr_best_bbox)
+            result_scores.append(c_scores[curr_best_id])
+            result_classes.append(clss)
+
+            c_bboxes = np.delete(c_bboxes, curr_best_id, axis=0)
+            c_scores = np.delete(c_scores, curr_best_id)
+
+            ious = calculate_IOU_nag(curr_best_bbox, c_bboxes).reshape(-1)
+            
+            index_to_eliminate = np.where(ious >= iou_threshold)
+            # print('{}Logging\nIOUs: {}'.format('*'*15, ious))
+            c_bboxes = np.delete(c_bboxes, index_to_eliminate, axis=0)
+            c_scores = np.delete(c_scores, index_to_eliminate)
+
+    result_bboxes = np.array(result_bboxes).reshape(-1,4)
+    result_scores = np.array(result_scores).reshape(-1)
+    result_classes = np.array(result_classes).reshape(-1)
+
+    return result_bboxes, result_scores, result_classes
 
 def non_max_suppression(y_batch, iou_threshold, prob_threshold):
     count = 0
@@ -355,28 +466,32 @@ def calculate_IOU_nag(bbox1, bbox2):
 
     Arguments:
     ---------
-    bbox1: [tf.tensor] 2D Array containing (x, y, w, h) with shape (nb_bboxes, 4)
-    bbox2: [tf.tensor] 2D Array containing (x, y, w, h) with shape (nb_bboxes, 4)
+    bbox1: [np.array] 2D Array containing (x, y, w, h) with shape (nb_bboxes, 4)
+    bbox2: [np.array] 2D Array containing (x, y, w, h) with shape (nb_bboxes, 4)
     """
-    bbox1_wh_half = bbox1[:,2:4]/2
-    bbox1_min = bbox1[:, 0:2] - bbox1_wh_half
-    bbox1_min = bbox1[:, 0:2] + bbox1_wh_half
+    epsilon = 1e-5 # Numerical hack
+    x1, y1, w1, h1 = np.split(bbox1, 4, axis=1)
+    x2, y2, w2, h2 = np.split(bbox2, 4, axis=1)
 
-    bbox2_wh_half = bbox2[:,2:4]/2
-    bbox2_min = bbox2[:, 0:2] - bbox2_wh_half
-    bbox2_min = bbox2[:, 0:2] + bbox2_wh_half
+    x_max1 = x1 + w1/2
+    x_min1 = x1 - w1/2
+    x_max2 = x2 + w2/2
+    x_min2 = x2 - w2/2
 
-    intersect_mins = tf.maximum(bbox1_min, bbox2_min, axis=1)
-    intersect_maxs = tf.maximum(bbox1_max, bbox2_max, axis=1)
-    intersect_wh = tf.maximum(intersect_maxs - intersect_mins, 0, axis=1)
-    intersect = intersect_wh[0] * intersect_wh[1]
+    y_max1 = y1 + h1/2
+    y_min1 = y1 - h1/2
+    y_max2 = y2 + h2/2
+    y_min2 = y2 - h2/2
 
-    bbox1_areas = bbox1[:, 2] * bbox1[:, 3]
-    bbox2_areas = bbox2[:, 2] * bbox2[:, 3]
+    intersect_x = np.maximum(np.minimum(x_max1, x_max2.T) - np.maximum(x_min1, x_min2.T), 0)
+    intersect_y = np.maximum(np.minimum(y_max1, y_max2.T) - np.maximum(y_min1, y_min2.T), 0)
+    intersect = intersect_x * intersect_y
 
-    union = bbox1_areas + bbox2_areas - intersect
-
-    return tf.divide_no_nan(intersect, union)
+    bboxes_areas_1 = (x_max1 - x_min1)*(y_max1 - y_min1)
+    bboxes_areas_2 = (x_max2 - x_min2)*(y_max2 - y_min2)
+    
+    union = (bboxes_areas_1 + bboxes_areas_2.T) - intersect
+    return np.divide(intersect, union, out=np.zeros_like(intersect), where=(union >= epsilon))
 
 def _interval_overlap(interval_a, interval_b):
         """
