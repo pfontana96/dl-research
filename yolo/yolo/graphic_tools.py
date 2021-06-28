@@ -1,6 +1,10 @@
 from matplotlib import pyplot as plt 
 import numpy as np
-import seaborn as sns
+
+def get_cmap(n, name="hsv"):
+    '''Returns a function that maps each index in 0, 1, ..., n-1 to a distinct 
+    RGB color; the keyword argument name must be a standard mpl colormap name.'''
+    return plt.cm.get_cmap(name, n)
 
 def plot_image(x_batch_instace, y_batch_instance, anchors, labels, plot_grid=False, confidence_threshold=0.01):
     grid_h, grid_w, _, _ = y_batch_instance.shape
@@ -42,56 +46,56 @@ def plot_img_with_gridcell(img, grids, color="yellow"):
     plt.yticks([(i + 0.5)*img_h/grid_h for i in range(grid_h)],
                 ["iGRIDH={}".format(i) for i in range(grid_h)])
 
-def plot_bbox(output_instance, img_shape, anchors, labels, confidence_threshold=0.0):
-    color_palette = list(sns.xkcd_rgb.values())
+# def plot_bbox(output_instance, img_shape, anchors, labels, confidence_threshold=0.0):
+#     color_palette = list(sns.xkcd_rgb.values())
 
-    grid_y, grid_x, anchor_id = np.where(output_instance[:,:,:,4] >= confidence_threshold)
+#     grid_y, grid_x, anchor_id = np.where(output_instance[:,:,:,4] >= confidence_threshold)
 
-    confident_outputs = output_instance[grid_y, grid_x, anchor_id] # Boxes with confidence 1
-    predicted_bboxes = confident_outputs[:, 0:4] # x, y, w, h
-    scores = confident_outputs[:, 4]
+#     confident_outputs = output_instance[grid_y, grid_x, anchor_id] # Boxes with confidence 1
+#     predicted_bboxes = confident_outputs[:, 0:4] # x, y, w, h
+#     scores = confident_outputs[:, 4]
 
-    nb_grids_y, nb_grids_x, _, _ = output_instance.shape
-    grid_width = img_shape[0]/nb_grids_x
-    grid_height = img_shape[1]/nb_grids_y
+#     nb_grids_y, nb_grids_x, _, _ = output_instance.shape
+#     grid_width = img_shape[0]/nb_grids_x
+#     grid_height = img_shape[1]/nb_grids_y
 
-    anchor_width = anchors[anchor_id, 0]
-    anchor_height = anchors[anchor_id, 1]
+#     anchor_width = anchors[anchor_id, 0]
+#     anchor_height = anchors[anchor_id, 1]
 
-    bbox_ids, labels_ids = np.where(confident_outputs[:, 5:])
-    names = labels[labels_ids]
+#     bbox_ids, labels_ids = np.where(confident_outputs[:, 5:])
+#     names = labels[labels_ids]
 
-    id_obj = 0
-    for bbox in predicted_bboxes:
-        x, y, w, h = bbox
+#     id_obj = 0
+#     for bbox in predicted_bboxes:
+#         x, y, w, h = bbox
 
-        x = (x + grid_x[id_obj])*grid_width 
-        y = (y + grid_y[id_obj])*grid_height
-        w = w*anchor_width[id_obj]
-        h = h*anchor_height[id_obj]
+#         x = (x + grid_x[id_obj])*grid_width 
+#         y = (y + grid_y[id_obj])*grid_height
+#         w = w*anchor_width[id_obj]
+#         h = h*anchor_height[id_obj]
 
-        c = color_palette[id_obj]
+#         c = color_palette[id_obj]
         
-        xmin = x - 0.5*w
-        xmax = x + 0.5*w
-        ymin = y - 0.5*h
-        ymax = y + 0.5*h
+#         xmin = x - 0.5*w
+#         xmax = x + 0.5*w
+#         ymin = y - 0.5*h
+#         ymax = y + 0.5*h
 
-        plt.text(x, y, "X",color=c,fontsize=15)
-        plt.text(xmin, ymin, "{} ({:.2f})".format(names[id_obj], scores[id_obj]), 
-                    color ='black', fontsize=7, backgroundcolor=c)
-        plt.plot(np.array([xmin,xmin]),
-                    np.array([ymin,ymax]),color=c,linewidth=5)
-        plt.plot(np.array([xmin,xmax]),
-                    np.array([ymin,ymin]),color=c,linewidth=5)
-        plt.plot(np.array([xmax,xmax]),
-                    np.array([ymax,ymin]),color=c,linewidth=5)  
-        plt.plot(np.array([xmin,xmax]),
-                    np.array([ymax,ymax]),color=c,linewidth=5)
-        id_obj += 1
+#         plt.text(x, y, "X",color=c,fontsize=15)
+#         plt.text(xmin, ymin, "{} ({:.2f})".format(names[id_obj], scores[id_obj]), 
+#                     color ='black', fontsize=7, backgroundcolor=c)
+#         plt.plot(np.array([xmin,xmin]),
+#                     np.array([ymin,ymax]),color=c,linewidth=5)
+#         plt.plot(np.array([xmin,xmax]),
+#                     np.array([ymin,ymin]),color=c,linewidth=5)
+#         plt.plot(np.array([xmax,xmax]),
+#                     np.array([ymax,ymin]),color=c,linewidth=5)  
+#         plt.plot(np.array([xmin,xmax]),
+#                     np.array([ymax,ymax]),color=c,linewidth=5)
+#         id_obj += 1
 
 def plot_bbox_abs(bboxes, scores, class_ids, labels, score_threshold=0.01):
-    color_palette = list(sns.xkcd_rgb.values())
+    color_palette = get_cmap(len(labels))
 
     confident_index = np.where(scores >= score_threshold)
     confident_bboxes = bboxes[confident_index]
@@ -102,7 +106,7 @@ def plot_bbox_abs(bboxes, scores, class_ids, labels, score_threshold=0.01):
         x, y, w, h = confident_bboxes[i]
         clss_id = class_ids[i]
         label = labels[clss_id]
-        c = color_palette[clss_id]
+        c = color_palette(clss_id)
         score = scores[i]
 
         xmin = x - 0.5*w
@@ -111,13 +115,19 @@ def plot_bbox_abs(bboxes, scores, class_ids, labels, score_threshold=0.01):
         ymax = y + 0.5*h
 
         plt.text(x, y, "X",color=c,fontsize=15)
-        plt.text(xmin, ymin, "{} ({:.2f})".format(label, score), 
-                    color ='black', fontsize=7, backgroundcolor=c)
-        plt.plot(np.array([xmin,xmin]),
-                    np.array([ymin,ymax]),color=c,linewidth=5)
-        plt.plot(np.array([xmin,xmax]),
-                    np.array([ymin,ymin]),color=c,linewidth=5)
-        plt.plot(np.array([xmax,xmax]),
-                    np.array([ymax,ymin]),color=c,linewidth=5)  
-        plt.plot(np.array([xmin,xmax]),
-                    np.array([ymax,ymax]),color=c,linewidth=5)
+        plot_label(label, xmin, ymin, c, score)
+        plot_bbox(xmin, xmax, ymin, ymax, c)
+
+def plot_label(name, x, y, bg, score=None):
+    text = "{} ({:.2f})".format(name, score) if score else "{}".format(name)
+    plt.text(x, y, text, color="black", fontsize=7, backgroundcolor=bg)
+
+def plot_bbox(xmin, xmax, ymin, ymax, c, lw=5):
+    plt.plot(np.array([xmin,xmin]),
+                np.array([ymin,ymax]),color=c,linewidth=lw)
+    plt.plot(np.array([xmin,xmax]),
+                np.array([ymin,ymin]),color=c,linewidth=lw)
+    plt.plot(np.array([xmax,xmax]),
+                np.array([ymax,ymin]),color=c,linewidth=lw)  
+    plt.plot(np.array([xmin,xmax]),
+                np.array([ymax,ymax]),color=c,linewidth=lw)

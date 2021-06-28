@@ -8,6 +8,7 @@ from itertools import chain
 import numpy as np
 import tensorflow as tf
 
+
 def extract_bboxes(y_batch, anchors, image_shape, max=False):
     """
     Loads a batch of prediction and returns bboxes.
@@ -17,7 +18,6 @@ def extract_bboxes(y_batch, anchors, image_shape, max=False):
     y_batch:     [tf.Tensor] Tensor of shape (batch_size, grid_w, grid_h, nb_anchors, 5+nb_classes)
     anchors:     [np.array] Array of shape (nb_anchors, 2) specifying anchors used for y_batch (width and height)
     image_shape: [np.array] [tuple] [list] Input Image shape (width and height)
-    max:         [bool] If max is set to True, only the class with max score will be returned
 
     Return:
     ------
@@ -25,42 +25,53 @@ def extract_bboxes(y_batch, anchors, image_shape, max=False):
                   where each bbox is defined by (x, y, w, h, [scores]) where [scores] = [Pc1, ..., Pcn]. 
                   If max is True, [scores] will consist of [max(Pc), argmax(Pc)] 
     """
-    _, nb_grids_y, nb_grids_x, nb_anchors, nb_classes = y_batch.shape
+    batch_size, _, _, _, nb_classes = y_batch.shape
     nb_classes -= 5
 
-    grid_width = image_shape[0]/nb_grids_x
-    grid_height = image_shape[1]/nb_grids_y
+    y_batch = rescale_output(y_batch, anchors, image_shape)
 
-    # Indices to use after reshape
-    grid_y_offsets = np.array(list(chain(*([x]*nb_grids_x*nb_anchors for x in range(nb_grids_y)))))
-    grid_x_offsets = np.array(list(chain(*([x]*nb_anchors for x in range(nb_grids_x))))*nb_grids_y)
-    anchor_index = np.array([range(nb_anchors)]*nb_grids_y*nb_grids_x).reshape(-1)
+    # Transform from gridcell's coordinates to absolute coords
+    y_batch = tf.reshape(y_batch, (batch_size, -1, 5+nb_classes)).numpy()
 
-    anchor_w_offsets = anchors[anchor_index, 0]
-    anchor_h_offsets = anchors[anchor_index, 1]
+    bboxes = y_batch[..., :4]
+    confs = y_batch[..., 4]
+    class_logits = y_batch[..., 5:]
 
-    bboxes = []
-    scores = []
-    for instance in y_batch:
-        scores_tf = tf.expand_dims(instance[:,:,:,4], axis=3)*instance[:,:,:,5:]
-        scores_tf = tf.reshape(scores_tf, (-1, nb_classes))
-        # We need to rescale bboxes from gridcell's position and anchor dimension back to rescaled
-        # image of config['image_shape']
+    return bboxes, confs, class_logits
 
-        bboxes_tf = tf.reshape(instance[:,:,:,0:4], (-1, 4))
-        scaled_back_x = tf.reshape((bboxes_tf[:,0]+grid_x_offsets)*grid_width, (-1,1))
-        scaled_back_y = tf.reshape((bboxes_tf[:,1]+grid_y_offsets)*grid_height, (-1,1))
-        scaled_back_w = tf.reshape(bboxes_tf[:,2]*anchor_w_offsets, (-1,1))
-        scaled_back_h = tf.reshape(bboxes_tf[:,3]*anchor_h_offsets, (-1,1))
+def rescale_output(y_batch, anchors, image_shape=None):
+    """
+    Rescales output to grid and anchor coordinates
 
-        bboxes_tf = tf.concat([scaled_back_x, 
-                               scaled_back_y,
-                               scaled_back_w,
-                               scaled_back_h], axis=1)
-        bboxes.append(bboxes_tf.numpy())
-        scores.append(scores_tf.numpy())
+    Arguments:
+    ---------
+    y_batch: [tf.Tensor] Tensor of shape (batch_size, grid_y, grid_x, nb_anchors, 5+nb_classes)
+    anchors: [np.array] Array of anchor (predictor) boxes of shape (nb_anchors, 2) specifying 
+                        width and heigth
+    image_shape: [np.array] Shape of input image. If specified, output will be in absolute coordinates
+                            (in px)
+    """
+    batch_size, nb_grid_y, nb_grid_x, nb_anchors, _ = y_batch.shape
 
-    return bboxes, scores
+    cell_x = tf.cast(tf.reshape(tf.tile(tf.range(nb_grid_x), [nb_grid_y]), 
+                        (1, nb_grid_y, nb_grid_x, 1, 1)), tf.float32)
+    cell_y = tf.transpose(cell_x, (0,2,1,3,4))
+    cell_grid = tf.tile(tf.concat([cell_x, cell_y], axis=-1), [batch_size, 1, 1, nb_anchors, 1])
+    
+    # Output in gridcell's coordinates
+    output_xy = y_batch[..., :2] + cell_grid 
+    output_wh = y_batch[..., 2:4] * np.reshape(anchors, [1, 1, 1, nb_anchors, 2])
+
+    if image_shape is not None:
+        # Return values in px
+        grid_width = image_shape[0]/nb_grid_x
+        grid_height = image_shape[1]/nb_grid_y
+        offsets = tf.cast(tf.reshape([grid_width, grid_height], (1,1,1,1,-1)), "float32")
+
+        output_xy = output_xy * offsets
+        output_wh = output_wh * offsets    
+
+    return tf.concat([output_xy, output_wh, y_batch[..., 4:]], axis=-1)
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #                                   COMMON UTILS
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  
@@ -303,126 +314,57 @@ class ImageReader(object):
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #                                   IOU AND NON MAX CALCULATIONS
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-def non_max_suppression_v2(bboxes, scores, class_ids, iou_threshold, score_threshold):
-    """
-    Calculates Non Max suppression in a numpy way
 
-    Arguments:
-    ---------
-    bboxes:          [np.array] Numpy array containing bboxes (x, y, w, h) in absolute 
-                                coordinates
-    scores:          [np.array] Array of scores corresponding to each bbox
-    iou_threshold:   [float] IOU threshold (each bbox with IOU >= IOU threshold will be discarted)
-    score_threshold: [float] Score threshold (each bbox with score < score_threshold will be 
-                             discarted)
-
-    Return:
-    ------
-    result_bboxes:   [np.array] Array of resulting bboxes 
-    result_scores:
-    result_classes:
-    """
+def non_max_suppression(bboxes, confidences, scores, iou_threshold, score_threshold):
     result_bboxes = []
     result_scores = []
     result_classes = []
 
+    confidences = confidences.reshape(-1)
+
     # Drop non confident bboxes
-    index = np.where(scores >= score_threshold)
+    index = np.where(confidences >= score_threshold)
+    class_ids = np.argmax(scores, axis=1)
+    print("Classes ids:")
+    print(class_ids)
+    scores = scores[range(len(class_ids)), class_ids]
 
     bboxes = bboxes[index]
     scores = scores[index]
     class_ids = class_ids[index]
+    print("Scores:")
+    print(scores)
+    
+    if len(confidences): # Assertion in case all predictions were dropped
+        for clss in np.unique(class_ids):
+            index = np.where(class_ids == clss)
+            print(index)
+            c_scores = scores[index]
+            c_bboxes = bboxes[index]
 
-    for clss in np.unique(class_ids):
-        index = np.where(class_ids == clss)
-        c_scores = scores[index]
-        c_bboxes = bboxes[index]
-        while len(c_scores):
-            curr_best_id = np.argmax(c_scores)
-            curr_best_bbox = c_bboxes[curr_best_id].reshape(-1,4)
-            
-            result_bboxes.append(curr_best_bbox)
-            result_scores.append(c_scores[curr_best_id])
-            result_classes.append(clss)
+            while len(c_scores):
+                curr_best_id = np.argmax(c_scores)
+                curr_best_bbox = c_bboxes[curr_best_id].reshape(-1,4)
+                
+                result_bboxes.append(curr_best_bbox.reshape(-1))
+                result_scores.append(c_scores[curr_best_id])
+                result_classes.append(clss)
 
-            c_bboxes = np.delete(c_bboxes, curr_best_id, axis=0)
-            c_scores = np.delete(c_scores, curr_best_id)
+                c_bboxes = np.delete(c_bboxes, curr_best_id, axis=0)
+                c_scores = np.delete(c_scores, curr_best_id)
 
-            ious = calculate_IOU_nag(curr_best_bbox, c_bboxes).reshape(-1)
-            
-            index_to_eliminate = np.where(ious >= iou_threshold)
-            # print('{}Logging\nIOUs: {}'.format('*'*15, ious))
-            c_bboxes = np.delete(c_bboxes, index_to_eliminate, axis=0)
-            c_scores = np.delete(c_scores, index_to_eliminate)
+                ious = calculate_IOU_nag(curr_best_bbox, c_bboxes).reshape(-1)
+                
+                index_to_eliminate = np.where(ious >= iou_threshold)
+                # print('{}Logging\nIOUs: {}'.format('*'*15, ious))
+                c_bboxes = np.delete(c_bboxes, index_to_eliminate, axis=0)
+                c_scores = np.delete(c_scores, index_to_eliminate)
 
-    result_bboxes = np.array(result_bboxes).reshape(-1,4)
-    result_scores = np.array(result_scores).reshape(-1)
-    result_classes = np.array(result_classes).reshape(-1)
+        result_bboxes = np.array(result_bboxes).reshape(-1,4)
+        result_scores = np.array(result_scores).reshape(-1)
+        result_classes = np.array(result_classes).reshape(-1)
 
     return result_bboxes, result_scores, result_classes
-
-def non_max_suppression(y_batch, iou_threshold, prob_threshold):
-    count = 0
-    new_y_batch = np.zeros(y_batch.shape)
-    _, grid_y, grid_x, nb_anchors, nb_classes = y_batch.shape 
-    nb_classes -= 5 # (x, y, w, h)
-    nb_bboxes = grid_y*grid_x*nb_anchors
-
-    iou_vfunc = np.frompyfunc(lambda x1, x2, x3, x4: calculate_IOU(
-                            np.array([x1, x2]), np.array([x3, x4])), 
-                            4, 1)
-    for instance in y_batch:
-        # For each instance we'll need to calculate the scores for each bounding box predicted
-        # As we're predicting Pc and C1, C2, ..., Cn as the scores will be calculated as follow
-        # score = Pc*Ci = P(Classi|Object)*P(Object)
-        scores = tf.multiply(tf.reshape(instance[:,:,:,5:], (-1, nb_classes)),
-                            tf.reshape(instance[:,:,:,4], (-1,1))).numpy()
-        
-        scores = np.where(scores == np.max(scores, axis=1, keepdims=True), scores, 0)
-
-        bboxes = tf.reshape(instance[:,:,:,2:4], (-1, 2)).numpy()
-
-        for class_id in range(nb_classes):
-            # mask = self.instance_non_max_suppression(bboxes, scores[:, class_id])
-            ids = np.array(range(nb_bboxes))
-            mask = np.zeros((nb_bboxes), dtype=bool)
-            c_scores = scores[:, class_id]
-            c_bboxes = bboxes
-
-            # Eliminate low confidence predictions
-            index = np.where(c_scores >= prob_threshold)[0]
-            ids = ids[index]
-            c_bboxes = c_bboxes[index]
-            c_scores = c_scores[index]
-
-            while len(ids):
-                best_index = np.argmax(c_scores)
-                best_id = ids[best_index]
-                best_bbox = c_bboxes[best_index]
-
-                # Mark current bbox in mask
-                mask[best_id] = True
-
-                ids = np.delete(ids, best_index)
-                c_bboxes = np.delete(c_bboxes, best_index, axis=0)
-
-                if not len(ids):
-                    break
-                    
-                ious = iou_vfunc(best_bbox[0], best_bbox[1], c_bboxes[:,0], c_bboxes[:,1])
-                remove_index = np.where(ious >= iou_threshold)[0]
-
-                ids = np.delete(ids, remove_index)
-                c_bboxes = np.delete(c_bboxes, remove_index, axis=0)
-                c_scores = np.delete(c_scores, np.concatenate((remove_index, [best_index])))
-
-            mask = mask.reshape(grid_y, grid_x, nb_anchors)
-
-            new_y_batch[count, mask] = instance[mask]
-
-        count += 1
-
-    return tf.constant(new_y_batch)    
 
 def tf_non_max_suppression(y_batch, iou_threshold, prob_threshold):
     count = 0
@@ -460,7 +402,7 @@ def tf_non_max_suppression(y_batch, iou_threshold, prob_threshold):
 
     return tf.constant(new_y_batch)
 
-def calculate_IOU_nag(bbox1, bbox2):
+def calculate_IOU_nag(bbox1, bbox2, broadcast=True):
     """
     Non agnostic calculation of IOU (depends on the position xy)
 
@@ -468,6 +410,10 @@ def calculate_IOU_nag(bbox1, bbox2):
     ---------
     bbox1: [np.array] 2D Array containing (x, y, w, h) with shape (nb_bboxes, 4)
     bbox2: [np.array] 2D Array containing (x, y, w, h) with shape (nb_bboxes, 4)
+    broadcast: [bool] If True, it calculates IOU scores for each bbox in bbox1 with respect to
+                each bbox in bbox2 (i.e. output shape is (nb_bboxes, nb_boxes)). If False, it 
+                calculates scores between bboxes on the same indices (i.e. output shape is 
+                (nb_bboxes,1)
     """
     epsilon = 1e-5 # Numerical hack
     x1, y1, w1, h1 = np.split(bbox1, 4, axis=1)
@@ -482,6 +428,13 @@ def calculate_IOU_nag(bbox1, bbox2):
     y_min1 = y1 - h1/2
     y_max2 = y2 + h2/2
     y_min2 = y2 - h2/2
+
+    if not broadcast:
+
+        x_min2 = x_min2.T
+        x_max2 = x_max2.T
+        y_min2 = y_min2.T
+        y_max2 = y_max2.T
 
     intersect_x = np.maximum(np.minimum(x_max1, x_max2.T) - np.maximum(x_min1, x_min2.T), 0)
     intersect_y = np.maximum(np.minimum(y_max1, y_max2.T) - np.maximum(y_min1, y_min2.T), 0)

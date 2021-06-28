@@ -61,6 +61,8 @@ schedule:
   - [20, 0.0001]
   - [35, 0.00001]
 
+lambda_coord: 5
+lambda_noobj: 0.5
 # log_path: path_to_log_dir
 
 # weights_path: path_to_h5_file

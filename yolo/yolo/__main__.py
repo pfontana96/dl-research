@@ -18,7 +18,10 @@ parser.add_argument("action", choices=["train", "predict"], nargs=1, help="actio
 
 parser.add_argument("-c", "--config", help="path to config file (defaults to config.yaml in \
                                             current directory)", nargs=1)
-parser.add_argument("-s", "--show", help="flag to plot output")
+
+parser.add_argument("-l", "--log", help="path to log dir (.csv) for training", nargs=1)
+
+parser.add_argument("-s", "--save", help="flag to save image in prediction (.jpg)")
 
 args = parser.parse_args()
 
@@ -43,7 +46,10 @@ def get_model(config, weights_file=None):
                               options:\n'adam' 'sgd' 'rmsprop'")
         
         if config['optimizer'] == 'adam':
-            optimizer = Adam(learning_rate=lr, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
+            beta_1 = config['beta_1'] if 'beta_1' in config.keys() else 0.0
+            beta_2 = config['beta_2'] if 'beta_2' in config.keys() else 0.0
+            optimizer = Adam(learning_rate=lr, beta_1=beta_1, beta_2=beta_2, 
+                                epsilon=1e-08, decay=0.0)
         
         if config['optimizer'] == 'sgd':
             momentum = config['momentum'] if 'momentum' in config.keys() else 0.0
@@ -74,7 +80,10 @@ def get_model(config, weights_file=None):
 
     return model
 
-def train(model):
+def train(model, log_dir=None):
+    pass
+
+def predict(model, log_dir=None):
     pass
 
 def main():
@@ -97,5 +106,10 @@ def main():
 
     model = get_model(config, weights_file)
 
+    if args.action == 'train':
+        print('Training..')
+    elif args.action == 'predict':
+        print('Making prediction..')
+        
 if __name__ == '__main__':
     main()
